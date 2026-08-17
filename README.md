@@ -52,6 +52,12 @@ python board.py complete <filename>
 
 Claude Code等から呼び出すためのスキルは別リポジトリで管理している。
 
+## 通知（任意）
+
+`agent-to-user`への追加時、環境変数`LINE_CHANNEL_ACCESS_TOKEN`・`LINE_NOTIFY_USER_ID`が設定されていれば、その項目をLINEへpush通知する（`related_links`があればボタン付きテンプレート、無ければ通常テキスト）。未設定なら何もしない（オプトイン、CLI自体の動作には影響しない）。通知の送信に失敗しても`add`コマンド自体は成功する。
+
+ボタンからの承認/却下postbackの受信（`user-to-agent`への書き込み）は本リポジトリの責務ではなく、公開HTTPSエンドポイントを持つ別サービス側（例: `ai-gateway`）で実装する。
+
 ## テスト
 
 ```

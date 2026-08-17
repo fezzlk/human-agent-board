@@ -3,15 +3,86 @@
 user and AI coding agents (Claude Code, Codex, etc.)."""
 
 import argparse
+import json
 import os
 import secrets
 import sys
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
 
 DIRECTIONS = ("user-to-agent", "agent-to-user")
+
+LINE_PUSH_URL = "https://api.line.me/v2/bot/message/push"
+_LINE_TITLE_MAX = 40
+_LINE_TEXT_MAX = 60
+
+
+def _truncate(text, limit):
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
+
+
+def notify_line(item, filename):
+    """Best-effort LINE push for a new agent-to-user item. No-op if the LINE
+    env vars aren't configured, and never raises -- a notification failure
+    must not affect the CLI's core add/list/complete behavior."""
+    token = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
+    user_id = os.environ.get("LINE_NOTIFY_USER_ID", "")
+    if not token or not user_id:
+        return
+
+    related_links = item.get("related_links") or []
+    title = _truncate(item.get("title"), _LINE_TITLE_MAX)
+    text = _truncate(item.get("body"), _LINE_TEXT_MAX)
+
+    if related_links:
+        message = {
+            "type": "template",
+            "altText": title or "human-agent-board",
+            "template": {
+                "type": "buttons",
+                "title": title or "human-agent-board",
+                "text": text or "(no details)",
+                "actions": [
+                    {
+                        "type": "postback",
+                        "label": "承認",
+                        "data": f"approve|{related_links[0]}",
+                    },
+                    {
+                        "type": "postback",
+                        "label": "却下",
+                        "data": f"reject|{related_links[0]}",
+                    },
+                ],
+            },
+        }
+    else:
+        message = {
+            "type": "text",
+            "text": f"{title}\n{text}".strip() or "human-agent-board: new item",
+        }
+
+    payload = json.dumps({"to": user_id, "messages": [message]}).encode("utf-8")
+    request = urllib.request.Request(
+        LINE_PUSH_URL,
+        data=payload,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}",
+        },
+    )
+    try:
+        urllib.request.urlopen(request, timeout=10)
+    except (urllib.error.URLError, OSError) as e:
+        print(f"notify_line: failed to push LINE notification: {e}", file=sys.stderr)
 
 
 def board_root() -> Path:
@@ -45,6 +116,9 @@ def add_item(direction, from_, type_, title, body, related_links=None):
 
     with path.open("w", encoding="utf-8") as f:
         yaml.safe_dump(item, f, allow_unicode=True, sort_keys=False)
+
+    if direction == "agent-to-user":
+        notify_line(item, filename)
 
     return filename
 

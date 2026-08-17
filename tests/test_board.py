@@ -1,4 +1,5 @@
 import importlib
+import json
 import sys
 from pathlib import Path
 
@@ -73,3 +74,80 @@ def test_add_with_related_links(board):
 
     assert "https://example.com/a" in content
     assert "https://example.com/b" in content
+
+
+def test_notify_line_noop_without_env(board, monkeypatch):
+    monkeypatch.delenv("LINE_CHANNEL_ACCESS_TOKEN", raising=False)
+    monkeypatch.delenv("LINE_NOTIFY_USER_ID", raising=False)
+    calls = []
+    monkeypatch.setattr(
+        board.urllib.request, "urlopen", lambda *a, **k: calls.append((a, k))
+    )
+
+    board.add_item(
+        direction="agent-to-user",
+        from_="kobito",
+        type_="plan_request",
+        title="do the thing",
+        body="details",
+        related_links=["https://example.com/issue"],
+    )
+
+    assert calls == []
+
+
+def test_notify_line_pushes_buttons_template_when_configured(board, monkeypatch):
+    monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "test-token")
+    monkeypatch.setenv("LINE_NOTIFY_USER_ID", "U1234")
+    calls = []
+
+    def fake_urlopen(request, timeout=None):
+        calls.append(request)
+
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        return _Resp()
+
+    monkeypatch.setattr(board.urllib.request, "urlopen", fake_urlopen)
+
+    board.add_item(
+        direction="agent-to-user",
+        from_="kobito",
+        type_="plan_request",
+        title="do the thing",
+        body="details",
+        related_links=["https://example.com/issue"],
+    )
+
+    assert len(calls) == 1
+    payload = json.loads(calls[0].data)
+    assert payload["to"] == "U1234"
+    template = payload["messages"][0]["template"]
+    assert template["actions"][0]["data"] == "approve|https://example.com/issue"
+    assert template["actions"][1]["data"] == "reject|https://example.com/issue"
+
+
+def test_notify_line_failure_does_not_raise(board, monkeypatch):
+    monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "test-token")
+    monkeypatch.setenv("LINE_NOTIFY_USER_ID", "U1234")
+
+    def raise_error(*a, **k):
+        raise board.urllib.error.URLError("boom")
+
+    monkeypatch.setattr(board.urllib.request, "urlopen", raise_error)
+
+    filename = board.add_item(
+        direction="agent-to-user",
+        from_="kobito",
+        type_="plan_request",
+        title="do the thing",
+        body="details",
+        related_links=["https://example.com/issue"],
+    )
+
+    assert board.list_items("agent-to-user")[0]["filename"] == filename
