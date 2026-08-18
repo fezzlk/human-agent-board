@@ -96,7 +96,7 @@ def test_notify_line_noop_without_env(board, monkeypatch):
     assert calls == []
 
 
-def test_notify_line_pushes_buttons_template_when_configured(board, monkeypatch):
+def test_notify_line_pushes_buttons_and_related_links_when_configured(board, monkeypatch):
     monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "test-token")
     monkeypatch.setenv("LINE_NOTIFY_USER_ID", "U1234")
     calls = []
@@ -121,15 +121,51 @@ def test_notify_line_pushes_buttons_template_when_configured(board, monkeypatch)
         type_="plan_request",
         title="do the thing",
         body="details",
-        related_links=["https://example.com/issue"],
+        related_links=[
+            "https://github.com/fezzlk/human-agent-board/pull/1",
+            "https://linear.app/fezzlk/issue/FEZ-110/example",
+            "https://example.com/design",
+        ],
     )
 
     assert len(calls) == 1
     payload = json.loads(calls[0].data)
     assert payload["to"] == "U1234"
+    assert len(payload["messages"]) == 2
     template = payload["messages"][0]["template"]
-    assert template["actions"][0]["data"] == "approve|https://example.com/issue"
-    assert template["actions"][1]["data"] == "reject|https://example.com/issue"
+    assert template["actions"][0]["data"] == (
+        "approve|https://github.com/fezzlk/human-agent-board/pull/1"
+    )
+    assert template["actions"][1]["data"] == (
+        "reject|https://github.com/fezzlk/human-agent-board/pull/1"
+    )
+    details = payload["messages"][1]
+    assert details["type"] == "text"
+    assert "GitHub: https://github.com/fezzlk/human-agent-board/pull/1" in details["text"]
+    assert "Linear: https://linear.app/fezzlk/issue/FEZ-110/example" in details["text"]
+    assert "関連資料 3: https://example.com/design" in details["text"]
+
+
+def test_notify_line_without_related_links_sends_text_only(board, monkeypatch):
+    monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "test-token")
+    monkeypatch.setenv("LINE_NOTIFY_USER_ID", "U1234")
+    calls = []
+
+    def fake_urlopen(request, timeout=None):
+        calls.append(request)
+
+    monkeypatch.setattr(board.urllib.request, "urlopen", fake_urlopen)
+
+    board.add_item(
+        direction="agent-to-user",
+        from_="kobito",
+        type_="fyi",
+        title="status",
+        body="no approval required",
+    )
+
+    payload = json.loads(calls[0].data)
+    assert payload["messages"] == [{"type": "text", "text": "status\nno approval required"}]
 
 
 def test_notify_line_failure_does_not_raise(board, monkeypatch):

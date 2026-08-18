@@ -8,6 +8,7 @@ import os
 import secrets
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,6 +20,7 @@ DIRECTIONS = ("user-to-agent", "agent-to-user")
 LINE_PUSH_URL = "https://api.line.me/v2/bot/message/push"
 _LINE_TITLE_MAX = 40
 _LINE_TEXT_MAX = 60
+_LINE_DETAILS_MAX = 5000
 
 
 def _truncate(text, limit):
@@ -26,6 +28,22 @@ def _truncate(text, limit):
     if len(text) <= limit:
         return text
     return text[: limit - 1].rstrip() + "…"
+
+
+def _related_link_label(url, index):
+    hostname = (urllib.parse.urlparse(url).hostname or "").lower()
+    if hostname == "github.com" or hostname.endswith(".github.com"):
+        return "GitHub"
+    if hostname == "linear.app" or hostname.endswith(".linear.app"):
+        return "Linear"
+    return f"関連資料 {index}"
+
+
+def _format_related_links(related_links):
+    lines = ["判断材料（内容を確認してから承認・却下してください）"]
+    for index, url in enumerate(related_links, start=1):
+        lines.append(f"{_related_link_label(url, index)}: {url}")
+    return _truncate("\n".join(lines), _LINE_DETAILS_MAX)
 
 
 def notify_line(item, filename):
@@ -42,7 +60,7 @@ def notify_line(item, filename):
     text = _truncate(item.get("body"), _LINE_TEXT_MAX)
 
     if related_links:
-        message = {
+        messages = [{
             "type": "template",
             "altText": title or "human-agent-board",
             "template": {
@@ -62,14 +80,17 @@ def notify_line(item, filename):
                     },
                 ],
             },
-        }
+        }, {
+            "type": "text",
+            "text": _format_related_links(related_links),
+        }]
     else:
-        message = {
+        messages = [{
             "type": "text",
             "text": f"{title}\n{text}".strip() or "human-agent-board: new item",
-        }
+        }]
 
-    payload = json.dumps({"to": user_id, "messages": [message]}).encode("utf-8")
+    payload = json.dumps({"to": user_id, "messages": messages}).encode("utf-8")
     request = urllib.request.Request(
         LINE_PUSH_URL,
         data=payload,
