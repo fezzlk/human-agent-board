@@ -110,6 +110,18 @@ def notify_line(item, filename):
                 "text": _format_related_links(related_links),
             })
 
+    _push_line_messages(messages, token=token, user_id=user_id)
+
+
+def _push_line_messages(messages, token=None, user_id=None):
+    """Best-effort LINE push of a pre-built messages array. No-op if the LINE
+    env vars aren't configured (unless explicitly passed in), and never
+    raises -- callers must keep working even if the notification fails."""
+    token = token or os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
+    user_id = user_id or os.environ.get("LINE_NOTIFY_USER_ID", "")
+    if not token or not user_id:
+        return
+
     payload = json.dumps({"to": user_id, "messages": messages}).encode("utf-8")
     request = urllib.request.Request(
         LINE_PUSH_URL,
@@ -123,7 +135,68 @@ def notify_line(item, filename):
     try:
         urllib.request.urlopen(request, timeout=10)
     except (urllib.error.URLError, OSError) as e:
-        print(f"notify_line: failed to push LINE notification: {e}", file=sys.stderr)
+        print(f"_push_line_messages: failed to push LINE notification: {e}", file=sys.stderr)
+
+
+_PRIORITY_LABELS = {1: "Urgent", 2: "High", 3: "Medium", 4: "Low"}
+_PRIORITY_DIGEST_MAX_BUBBLES = 12
+_PRIORITY_BUBBLE_TITLE_MAX = 60
+
+
+def priority_digest(issues):
+    """Push a LINE Flex carousel with one bubble per issue (identifier,
+    title, project) and four priority buttons (Urgent/High/Medium/Low) that
+    postback `setpriority|<issueId>|<priorityValue>`. No-op on an empty
+    list or when LINE env vars aren't configured."""
+    issues = list(issues)[:_PRIORITY_DIGEST_MAX_BUBBLES]
+    if not issues:
+        return
+
+    bubbles = []
+    for issue in issues:
+        issue_id = issue["id"]
+        identifier = issue.get("identifier", "")
+        title = _truncate(issue.get("title"), _PRIORITY_BUBBLE_TITLE_MAX)
+        project = issue.get("project", "")
+        bubbles.append({
+            "type": "bubble",
+            "body": {
+                "type": "box",
+                "layout": "vertical",
+                "spacing": "sm",
+                "contents": [
+                    {"type": "text", "text": identifier, "size": "xs", "color": "#9CA3AF"},
+                    {"type": "text", "text": title, "weight": "bold", "wrap": True},
+                    {"type": "text", "text": project, "size": "xs", "color": "#6B7280"},
+                ],
+            },
+            "footer": {
+                "type": "box",
+                "layout": "vertical",
+                "spacing": "sm",
+                "contents": [
+                    {
+                        "type": "button",
+                        "style": "primary" if value <= 2 else "secondary",
+                        "height": "sm",
+                        "action": {
+                            "type": "postback",
+                            "label": label,
+                            "data": f"setpriority|{issue_id}|{value}",
+                            "displayText": f"{identifier}: {label}",
+                        },
+                    }
+                    for value, label in _PRIORITY_LABELS.items()
+                ],
+            },
+        })
+
+    messages = [{
+        "type": "flex",
+        "altText": f"優先度未設定のissueが{len(bubbles)}件あります",
+        "contents": {"type": "carousel", "contents": bubbles},
+    }]
+    _push_line_messages(messages)
 
 
 def board_root() -> Path:
@@ -549,6 +622,12 @@ def _cmd_status_list(args):
     print(format_status_list(source=args.source, recent=args.recent))
 
 
+def _cmd_priority_digest(args):
+    issues = json.load(sys.stdin)
+    priority_digest(issues)
+    print(f"sent digest for {min(len(issues), _PRIORITY_DIGEST_MAX_BUBBLES)} issue(s)")
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -619,6 +698,12 @@ def build_parser():
     status_list_parser.add_argument("--source")
     status_list_parser.add_argument("--recent", type=int, default=5)
     status_list_parser.set_defaults(func=_cmd_status_list)
+
+    priority_digest_parser = subparsers.add_parser(
+        "priority-digest",
+        help="Push a LINE carousel of no-priority issues (JSON array via stdin)",
+    )
+    priority_digest_parser.set_defaults(func=_cmd_priority_digest)
 
     return parser
 

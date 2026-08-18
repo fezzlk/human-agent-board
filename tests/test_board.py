@@ -394,3 +394,85 @@ def test_record_and_dashboard_usage(board):
 def test_record_usage_rejects_invalid_percentage(board):
     with pytest.raises(ValueError, match="between 0 and 100"):
         board.record_usage("claude", 101)
+
+
+def test_priority_digest_noop_on_empty(board, monkeypatch):
+    monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "test-token")
+    monkeypatch.setenv("LINE_NOTIFY_USER_ID", "U1234")
+    calls = []
+    monkeypatch.setattr(
+        board.urllib.request, "urlopen", lambda *a, **k: calls.append((a, k))
+    )
+
+    board.priority_digest([])
+
+    assert calls == []
+
+
+def test_priority_digest_sends_carousel_with_priority_buttons(board, monkeypatch):
+    monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "test-token")
+    monkeypatch.setenv("LINE_NOTIFY_USER_ID", "U1234")
+    calls = []
+
+    def fake_urlopen(request, timeout=None):
+        calls.append(request)
+
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        return _Resp()
+
+    monkeypatch.setattr(board.urllib.request, "urlopen", fake_urlopen)
+
+    board.priority_digest([
+        {
+            "id": "issue-uuid-1",
+            "identifier": "FEZ-200",
+            "title": "example issue",
+            "project": "kobito",
+            "url": "https://linear.app/fezzlk/issue/FEZ-200/example",
+        },
+    ])
+
+    assert len(calls) == 1
+    payload = json.loads(calls[0].data)
+    assert payload["to"] == "U1234"
+    bubble = payload["messages"][0]["contents"]["contents"][0]
+    actions = [b["action"] for b in bubble["footer"]["contents"]]
+    assert actions[0]["data"] == "setpriority|issue-uuid-1|1"
+    assert actions[0]["label"] == "Urgent"
+    assert actions[3]["data"] == "setpriority|issue-uuid-1|4"
+    assert actions[3]["label"] == "Low"
+
+
+def test_priority_digest_caps_at_twelve_bubbles(board, monkeypatch):
+    monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "test-token")
+    monkeypatch.setenv("LINE_NOTIFY_USER_ID", "U1234")
+    calls = []
+
+    def fake_urlopen(request, timeout=None):
+        calls.append(request)
+
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        return _Resp()
+
+    monkeypatch.setattr(board.urllib.request, "urlopen", fake_urlopen)
+
+    issues = [
+        {"id": f"issue-{i}", "identifier": f"FEZ-{i}", "title": "t", "project": "p"}
+        for i in range(20)
+    ]
+    board.priority_digest(issues)
+
+    payload = json.loads(calls[0].data)
+    assert len(payload["messages"][0]["contents"]["contents"]) == 12
