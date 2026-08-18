@@ -145,6 +145,92 @@ def status_history_dir() -> Path:
     return board_root() / "status" / "history"
 
 
+def usage_snapshots_path() -> Path:
+    return board_root() / "usage" / "snapshots.jsonl"
+
+
+def record_usage(provider, primary_used, secondary_used=None,
+                 primary_resets_at=None, secondary_resets_at=None,
+                 work_id=None, source="collector", recorded_at=None):
+    if provider not in ("claude", "codex"):
+        raise ValueError("provider must be claude or codex")
+    for name, value in (("primary_used", primary_used), ("secondary_used", secondary_used)):
+        if value is not None and not 0 <= float(value) <= 100:
+            raise ValueError(f"{name} must be between 0 and 100")
+    item = {
+        "provider": provider,
+        "recorded_at": recorded_at or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "primary_used": float(primary_used),
+        "source": source,
+    }
+    if secondary_used is not None:
+        item["secondary_used"] = float(secondary_used)
+    if primary_resets_at is not None:
+        item["primary_resets_at"] = primary_resets_at
+    if secondary_resets_at is not None:
+        item["secondary_resets_at"] = secondary_resets_at
+    if work_id:
+        item["work_id"] = _safe_status_key(work_id, "work_id")
+    path = usage_snapshots_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(item, ensure_ascii=False) + "\n")
+    return item
+
+
+def list_usage(provider=None, hours=720):
+    path = usage_snapshots_path()
+    if not path.exists():
+        return []
+    cutoff = datetime.now(timezone.utc).timestamp() - max(1, hours) * 3600
+    items = []
+    with path.open(encoding="utf-8") as f:
+        for line in f:
+            try:
+                item = json.loads(line)
+                timestamp = datetime.fromisoformat(item["recorded_at"].replace("Z", "+00:00")).timestamp()
+            except (ValueError, KeyError, json.JSONDecodeError):
+                continue
+            if timestamp >= cutoff and (not provider or item.get("provider") == provider):
+                items.append(item)
+    return sorted(items, key=lambda item: item["recorded_at"])
+
+
+def usage_dashboard(hours=720):
+    snapshots = list_usage(hours=hours)
+    latest = {}
+    for item in snapshots:
+        latest[item["provider"]] = item
+    grouped = {}
+    for item in snapshots:
+        if item.get("work_id"):
+            grouped.setdefault((item["provider"], item["work_id"]), []).append(item)
+    tasks = []
+    for (provider, work_id), values in grouped.items():
+        first, last = values[0], values[-1]
+        same_window = first.get("primary_resets_at") == last.get("primary_resets_at")
+        delta = last["primary_used"] - first["primary_used"] if same_window else None
+        tasks.append({
+            "provider": provider,
+            "work_id": work_id,
+            "started_at": first["recorded_at"],
+            "ended_at": last["recorded_at"],
+            "primary_used_delta": max(0, delta) if delta is not None else None,
+            "sample_count": len(values),
+        })
+    return {
+        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "hours": hours,
+        "latest": latest,
+        "snapshots": snapshots,
+        "tasks": sorted(tasks, key=lambda item: item["ended_at"], reverse=True),
+        "savings": {
+            "status": "insufficient_data",
+            "message": "Board導入前後の比較に必要なデータを蓄積中です。",
+        },
+    }
+
+
 def _safe_status_key(value, field_name):
     if not re.fullmatch(r"[A-Za-z0-9._-]+", value or ""):
         raise ValueError(f"{field_name} must contain only letters, numbers, ., _, or -")
@@ -428,6 +514,23 @@ def _cmd_dashboard(args):
     )
 
 
+def _cmd_usage_record(args):
+    item = record_usage(
+        provider=args.provider,
+        primary_used=args.primary_used,
+        secondary_used=args.secondary_used,
+        primary_resets_at=args.primary_resets_at,
+        secondary_resets_at=args.secondary_resets_at,
+        work_id=args.work_id,
+        source=args.source,
+    )
+    print(json.dumps(item, ensure_ascii=False))
+
+
+def _cmd_usage_dashboard(args):
+    print(json.dumps(usage_dashboard(hours=args.hours), ensure_ascii=False))
+
+
 def _cmd_status_set(args):
     filename = set_status(
         source=args.source,
@@ -482,6 +585,21 @@ def build_parser():
     dashboard_parser.add_argument("--recent", type=int, default=5)
     dashboard_parser.add_argument("--json", action="store_true")
     dashboard_parser.set_defaults(func=_cmd_dashboard)
+
+    usage_parser = subparsers.add_parser("usage", help="Record and summarize plan usage")
+    usage_subparsers = usage_parser.add_subparsers(dest="usage_command", required=True)
+    usage_record_parser = usage_subparsers.add_parser("record", help="Record a usage snapshot")
+    usage_record_parser.add_argument("--provider", choices=("claude", "codex"), required=True)
+    usage_record_parser.add_argument("--primary-used", type=float, required=True)
+    usage_record_parser.add_argument("--secondary-used", type=float)
+    usage_record_parser.add_argument("--primary-resets-at")
+    usage_record_parser.add_argument("--secondary-resets-at")
+    usage_record_parser.add_argument("--work-id")
+    usage_record_parser.add_argument("--source", default="collector")
+    usage_record_parser.set_defaults(func=_cmd_usage_record)
+    usage_dashboard_parser = usage_subparsers.add_parser("dashboard", help="Show usage history")
+    usage_dashboard_parser.add_argument("--hours", type=int, default=720)
+    usage_dashboard_parser.set_defaults(func=_cmd_usage_dashboard)
 
     status_parser = subparsers.add_parser("status", help="Manage agent work status")
     status_subparsers = status_parser.add_subparsers(dest="status_command", required=True)

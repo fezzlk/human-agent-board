@@ -372,3 +372,25 @@ def test_notify_line_failure_does_not_raise(board, monkeypatch):
     )
 
     assert board.list_items("agent-to-user")[0]["filename"] == filename
+
+
+def test_record_and_dashboard_usage(board):
+    board.record_usage(
+        "codex", 20, 40, "reset-a", "reset-b", "FEZ-113",
+        recorded_at="2026-08-18T10:00:00Z",
+    )
+    board.record_usage(
+        "codex", 27, 43, "reset-a", "reset-b", "FEZ-113",
+        recorded_at="2026-08-18T11:00:00Z",
+    )
+
+    dashboard = board.usage_dashboard(hours=100000)
+
+    assert dashboard["latest"]["codex"]["primary_used"] == 27
+    assert dashboard["tasks"][0]["primary_used_delta"] == 7
+    assert dashboard["savings"]["status"] == "insufficient_data"
+
+
+def test_record_usage_rejects_invalid_percentage(board):
+    with pytest.raises(ValueError, match="between 0 and 100"):
+        board.record_usage("claude", 101)

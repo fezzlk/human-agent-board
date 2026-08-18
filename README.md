@@ -64,6 +64,18 @@ python board.py complete <filename>
 
 # kobitoの現在状態と直近5件の完了・失敗を表示
 python board.py status list --source kobito --recent 5
+
+# Claude/Codexの利用量履歴・タスク別差分を取得
+python board.py usage dashboard --hours 168
+```
+
+Claudeは`scripts/claude_usage_statusline.py`をClaude CodeのstatusLineに設定すると、セッション中に5時間・7日枠を記録する。Codexは`scripts/collect_codex_usage.py`が公式app-serverプロトコルから現在値を記録する。`HUMAN_AGENT_WORK_ID=FEZ-123`を設定して実行するとissue単位の差分集計対象になる。Claudeの無操作期間など取得できない時間は推測で補完しない。
+
+macOSでは次でClaude statuslineと15分間隔のCodex収集LaunchAgentを設定する。既存のClaude設定は保持し、`statusLine`だけを追加・更新する。
+
+```bash
+python3 scripts/install_usage_collectors.py
+launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.fezzlk.human-agent-board-usage.plist
 ```
 
 `board`のルートは既定でこのリポジトリ直下の`board/`。環境変数`HUMAN_AGENT_BOARD_ROOT`で変更できる（テスト用）。
