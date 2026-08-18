@@ -19,6 +19,8 @@ pip install -r requirements.txt
 board/
   user-to-agent/     # ユーザー → エージェントへの作業依頼
   agent-to-user/     # エージェント → ユーザーへの判断・確認・許可要求
+  status/current/    # エージェントのissue単位の現在状態（同じissueは上書き）
+  status/history/    # 完了・失敗した作業の直近履歴
 ```
 
 各依頼は1ファイル1YAML（`board/<direction>/{タイムスタンプ}_{ランダムID}.yaml`）。処理が完了したファイルは削除する（履歴はgitのコミット履歴に残る）。
@@ -49,6 +51,9 @@ python board.py list --direction agent-to-user
 
 # 処理済みにする（ファイルを削除）
 python board.py complete <filename>
+
+# kobitoの現在状態と直近5件の完了・失敗を表示
+python board.py status list --source kobito --recent 5
 ```
 
 `board`のルートは既定でこのリポジトリ直下の`board/`。環境変数`HUMAN_AGENT_BOARD_ROOT`で変更できる（テスト用）。
@@ -62,6 +67,31 @@ Claude Code等から呼び出すためのスキルは別リポジトリで管理
 `related_links`が無い場合は通常テキストのみを送り、承認・却下ボタンは表示しない。環境変数が未設定なら通知は行わない（オプトイン、CLI自体の動作には影響しない）。通知の送信に失敗しても`add`コマンド自体は成功し、boardへの項目追加は保持される。
 
 ボタンからの承認/却下postbackの受信（`user-to-agent`への書き込み）は本リポジトリの責務ではなく、公開HTTPSエンドポイントを持つ別サービス側（例: `ai-gateway`）で実装する。
+
+## 作業状況
+
+長時間動作するエージェントは、issue単位の状態を`status set`で更新する。
+
+```bash
+python board.py status set \
+  --source kobito --work-id FEZ-111 --state implementing \
+  --title "kobitoの作業状況確認" \
+  --summary "boardのstatusコマンドを実装中" \
+  --next-action "テストを実行する" \
+  --related-link "https://linear.app/example/issue/FEZ-111/example"
+```
+
+状態は`waiting`、`researching`、`implementing`、`verifying`、`decision_pending`、`pr_open`、`completed`、`failed`のいずれか。同じ`source`と`work-id`の進行中状態は上書きされるため、古い途中経過が一覧に残らない。`completed`と`failed`は現在状態から取り除かれ、`status/history/`へ保存される。履歴ファイルは自動削除せず保持し、一覧・LINEでは既定で直近5件だけを表示する（`--recent`で表示件数を変更可能）。
+
+`--notify`を付けるとLINEにも状態を送る。状態通知には判断材料リンクを表示するが、承認・却下ボタンは付けない。通知過多を避けるため、通常は`decision_pending`、`pr_open`、`completed`、`failed`などユーザーに意味のある状態遷移だけで指定する。細かな途中経過はboardの状態だけを更新する。
+
+現在状態と直近履歴は次で確認できる。
+
+```bash
+python board.py status list --source kobito --recent 5
+```
+
+現在状態はエージェントが更新するリアルタイム表示用のスナップショットであり、タスク・優先度・正式な完了状態の正本はLinear等のissueトラッカーとする。
 
 ## テスト
 

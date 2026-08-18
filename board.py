@@ -5,6 +5,7 @@ user and AI coding agents (Claude Code, Codex, etc.)."""
 import argparse
 import json
 import os
+import re
 import secrets
 import sys
 import urllib.error
@@ -16,6 +17,18 @@ from pathlib import Path
 import yaml
 
 DIRECTIONS = ("user-to-agent", "agent-to-user")
+WORK_STATES = (
+    "waiting",
+    "researching",
+    "implementing",
+    "verifying",
+    "decision_pending",
+    "pr_open",
+    "completed",
+    "failed",
+)
+TERMINAL_WORK_STATES = ("completed", "failed")
+DECISION_TYPES = ("approval_request", "decision_request", "plan_request")
 
 LINE_PUSH_URL = "https://api.line.me/v2/bot/message/push"
 _LINE_TITLE_MAX = 40
@@ -59,7 +72,9 @@ def notify_line(item, filename):
     title = _truncate(item.get("title"), _LINE_TITLE_MAX)
     text = _truncate(item.get("body"), _LINE_TEXT_MAX)
 
-    if related_links:
+    requires_decision = item.get("type") in DECISION_TYPES
+
+    if related_links and requires_decision:
         messages = [{
             "type": "template",
             "altText": title or "human-agent-board",
@@ -89,6 +104,11 @@ def notify_line(item, filename):
             "type": "text",
             "text": f"{title}\n{text}".strip() or "human-agent-board: new item",
         }]
+        if related_links:
+            messages.append({
+                "type": "text",
+                "text": _format_related_links(related_links),
+            })
 
     payload = json.dumps({"to": user_id, "messages": messages}).encode("utf-8")
     request = urllib.request.Request(
@@ -115,6 +135,124 @@ def board_root() -> Path:
 
 def direction_dir(direction: str) -> Path:
     return board_root() / direction
+
+
+def status_current_dir() -> Path:
+    return board_root() / "status" / "current"
+
+
+def status_history_dir() -> Path:
+    return board_root() / "status" / "history"
+
+
+def _safe_status_key(value, field_name):
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", value or ""):
+        raise ValueError(f"{field_name} must contain only letters, numbers, ., _, or -")
+    return value
+
+
+def _status_path(source, work_id):
+    source = _safe_status_key(source, "source")
+    work_id = _safe_status_key(work_id, "work_id")
+    return status_current_dir() / f"{source}__{work_id}.yaml"
+
+
+def set_status(source, work_id, state, title, summary, next_action=None,
+               related_links=None, notify=False):
+    if state not in WORK_STATES:
+        raise ValueError(f"state must be one of: {', '.join(WORK_STATES)}")
+
+    now = datetime.now(timezone.utc)
+    item = {
+        "source": source,
+        "work_id": work_id,
+        "state": state,
+        "title": title,
+        "summary": summary,
+        "updated_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    if next_action:
+        item["next_action"] = next_action
+    if related_links:
+        item["related_links"] = list(related_links)
+
+    current_path = _status_path(source, work_id)
+    if state in TERMINAL_WORK_STATES:
+        directory = status_history_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / (
+            f"{now.strftime('%Y%m%dT%H%M%SZ')}_{source}__{work_id}_"
+            f"{secrets.token_hex(3)}.yaml"
+        )
+        if current_path.exists():
+            current_path.unlink()
+    else:
+        current_path.parent.mkdir(parents=True, exist_ok=True)
+        path = current_path
+
+    with path.open("w", encoding="utf-8") as f:
+        yaml.safe_dump(item, f, allow_unicode=True, sort_keys=False)
+
+    if notify:
+        notify_line(
+            {
+                "type": "status_update",
+                "title": f"{work_id}: {title}",
+                "body": f"[{state}] {summary}",
+                "related_links": item.get("related_links", []),
+            },
+            path.name,
+        )
+    return path.name
+
+
+def _load_status_files(directory):
+    if not directory.exists():
+        return []
+    items = []
+    for path in directory.glob("*.yaml"):
+        with path.open(encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        data["filename"] = path.name
+        items.append(data)
+    items.sort(key=lambda item: item.get("updated_at", ""), reverse=True)
+    return items
+
+
+def list_statuses(source=None, recent=5):
+    current = _load_status_files(status_current_dir())
+    history = _load_status_files(status_history_dir())
+    if source:
+        current = [item for item in current if item.get("source") == source]
+        history = [item for item in history if item.get("source") == source]
+    return current, history[:recent]
+
+
+def _format_status_item(item):
+    lines = [
+        f"[{item.get('state', 'unknown')}] {item.get('work_id', '?')}: "
+        f"{item.get('title', '(no title)')}",
+        f"  {item.get('summary', '(no summary)')}",
+    ]
+    if item.get("next_action"):
+        lines.append(f"  次: {item['next_action']}")
+    lines.append(f"  更新: {item.get('updated_at', 'unknown')}")
+    for index, url in enumerate(item.get("related_links") or [], start=1):
+        lines.append(f"  {_related_link_label(url, index)}: {url}")
+    return "\n".join(lines)
+
+
+def format_status_list(source=None, recent=5):
+    current, history = list_statuses(source=source, recent=recent)
+    if not current and not history:
+        return "kobitoの作業状況はありません。" if source == "kobito" else "作業状況はありません。"
+
+    sections = []
+    if current:
+        sections.append("進行中\n" + "\n\n".join(_format_status_item(i) for i in current))
+    if history:
+        sections.append("直近の完了・失敗\n" + "\n\n".join(_format_status_item(i) for i in history))
+    return "\n\n".join(sections)
 
 
 def add_item(direction, from_, type_, title, body, related_links=None):
@@ -202,6 +340,24 @@ def _cmd_complete(args):
     print(f"completed ({direction}): {args.filename}")
 
 
+def _cmd_status_set(args):
+    filename = set_status(
+        source=args.source,
+        work_id=args.work_id,
+        state=args.state,
+        title=args.title,
+        summary=args.summary,
+        next_action=args.next_action,
+        related_links=args.related_link,
+        notify=args.notify,
+    )
+    print(filename)
+
+
+def _cmd_status_list(args):
+    print(format_status_list(source=args.source, recent=args.recent))
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -223,6 +379,25 @@ def build_parser():
     complete_parser.add_argument("filename")
     complete_parser.set_defaults(func=_cmd_complete)
 
+    status_parser = subparsers.add_parser("status", help="Manage agent work status")
+    status_subparsers = status_parser.add_subparsers(dest="status_command", required=True)
+
+    status_set_parser = status_subparsers.add_parser("set", help="Create or update work status")
+    status_set_parser.add_argument("--source", required=True)
+    status_set_parser.add_argument("--work-id", required=True)
+    status_set_parser.add_argument("--state", choices=WORK_STATES, required=True)
+    status_set_parser.add_argument("--title", required=True)
+    status_set_parser.add_argument("--summary", required=True)
+    status_set_parser.add_argument("--next-action")
+    status_set_parser.add_argument("--related-link", action="append", default=None)
+    status_set_parser.add_argument("--notify", action="store_true")
+    status_set_parser.set_defaults(func=_cmd_status_set)
+
+    status_list_parser = status_subparsers.add_parser("list", help="List current and recent work status")
+    status_list_parser.add_argument("--source")
+    status_list_parser.add_argument("--recent", type=int, default=5)
+    status_list_parser.set_defaults(func=_cmd_status_list)
+
     return parser
 
 
@@ -231,7 +406,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         args.func(args)
-    except FileNotFoundError as e:
+    except (FileNotFoundError, ValueError) as e:
         print(str(e), file=sys.stderr)
         return 1
     return 0
