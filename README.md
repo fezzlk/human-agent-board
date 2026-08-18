@@ -49,6 +49,16 @@ python board.py add --direction agent-to-user --from claude --type approval_requ
 # 未処理の依頼を一覧表示
 python board.py list --direction agent-to-user
 
+# LINE等のUI向けに、判断待ち・依頼・通知・作業状況をJSONで取得
+python board.py dashboard --json --recent 5
+
+# 1件の内容を取得
+python board.py get <filename> --json
+
+# 判断要求へ回答し、元の要求を処理済みにする
+python board.py respond <filename> --decision approval
+python board.py respond <filename> --decision rejection
+
 # 処理済みにする（ファイルを削除）
 python board.py complete <filename>
 

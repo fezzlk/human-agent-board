@@ -59,6 +59,11 @@ def test_complete_missing_file_raises(board):
         board.complete_item("does-not-exist.yaml")
 
 
+def test_complete_rejects_path_traversal(board):
+    with pytest.raises(ValueError):
+        board.complete_item("../outside.yaml")
+
+
 def test_add_with_related_links(board):
     filename = board.add_item(
         direction="agent-to-user",
@@ -74,6 +79,97 @@ def test_add_with_related_links(board):
 
     assert "https://example.com/a" in content
     assert "https://example.com/b" in content
+
+
+def test_get_item_returns_full_item(board):
+    filename = board.add_item(
+        direction="agent-to-user",
+        from_="kobito",
+        type_="decision_request",
+        title="choose approach",
+        body="full details",
+        related_links=["https://linear.app/example/issue/FEZ-112/example"],
+    )
+
+    item = board.get_item(filename)
+
+    assert item["filename"] == filename
+    assert item["direction"] == "agent-to-user"
+    assert item["body"] == "full details"
+    assert item["related_links"] == [
+        "https://linear.app/example/issue/FEZ-112/example"
+    ]
+
+
+def test_respond_to_item_records_response_and_completes_request(board):
+    filename = board.add_item(
+        direction="agent-to-user",
+        from_="kobito",
+        type_="approval_request",
+        title="deploy?",
+        body="please decide",
+        related_links=["https://github.com/example/repo/pull/1"],
+    )
+
+    response_filename = board.respond_to_item(filename, "approval")
+
+    with pytest.raises(FileNotFoundError):
+        board.get_item(filename)
+    response = board.get_item(response_filename, direction="user-to-agent")
+    assert response["type"] == "approval"
+    assert response["title"] == "承認 (LINE経由): deploy?"
+    assert response["related_links"] == ["https://github.com/example/repo/pull/1"]
+
+
+def test_respond_rejects_non_decision_item(board):
+    filename = board.add_item(
+        direction="agent-to-user",
+        from_="kobito",
+        type_="fyi",
+        title="done",
+        body="just information",
+    )
+
+    with pytest.raises(ValueError):
+        board.respond_to_item(filename, "approval")
+
+
+def test_dashboard_data_groups_board_items_and_status(board):
+    board.add_item(
+        direction="agent-to-user",
+        from_="kobito",
+        type_="decision_request",
+        title="decision",
+        body="choose",
+    )
+    board.add_item(
+        direction="agent-to-user",
+        from_="kobito",
+        type_="fyi",
+        title="notice",
+        body="done",
+    )
+    board.add_item(
+        direction="user-to-agent",
+        from_="user",
+        type_="task",
+        title="request",
+        body="please work",
+    )
+    board.set_status(
+        source="kobito",
+        work_id="FEZ-112",
+        state="implementing",
+        title="dashboard",
+        summary="building it",
+    )
+
+    data = board.dashboard_data()
+
+    assert [item["title"] for item in data["decisions"]] == ["decision"]
+    assert [item["title"] for item in data["notifications"]] == ["notice"]
+    assert [item["title"] for item in data["user_requests"]] == ["request"]
+    assert data["status_current"][0]["work_id"] == "FEZ-112"
 
 
 def test_notify_line_noop_without_env(board, monkeypatch):

@@ -282,30 +282,93 @@ def add_item(direction, from_, type_, title, body, related_links=None):
     return filename
 
 
-def list_items(direction):
+def _safe_item_filename(filename):
+    if not filename or Path(filename).name != filename or not filename.endswith(".yaml"):
+        raise ValueError("invalid board item filename")
+    return filename
+
+
+def get_item(filename, direction=None):
+    filename = _safe_item_filename(filename)
+    directions = (direction,) if direction else DIRECTIONS
+    for candidate_direction in directions:
+        if candidate_direction not in DIRECTIONS:
+            raise ValueError(f"direction must be one of: {', '.join(DIRECTIONS)}")
+        path = direction_dir(candidate_direction) / filename
+        if path.exists():
+            with path.open(encoding="utf-8") as f:
+                item = yaml.safe_load(f) or {}
+            item["filename"] = filename
+            item["direction"] = candidate_direction
+            return item
+    raise FileNotFoundError(f"{filename} not found")
+
+
+def list_items_full(direction):
     directory = direction_dir(direction)
     if not directory.exists():
         return []
 
     items = []
     for path in directory.glob("*.yaml"):
-        with path.open(encoding="utf-8") as f:
-            data = yaml.safe_load(f) or {}
-        items.append(
-            {
-                "filename": path.name,
-                "from": data.get("from"),
-                "type": data.get("type"),
-                "title": data.get("title"),
-                "created_at": data.get("created_at"),
-            }
-        )
-
+        items.append(get_item(path.name, direction=direction))
     items.sort(key=lambda item: item["filename"])
     return items
 
 
+def list_items(direction):
+    return [
+        {
+            "filename": item["filename"],
+            "from": item.get("from"),
+            "type": item.get("type"),
+            "title": item.get("title"),
+            "created_at": item.get("created_at"),
+        }
+        for item in list_items_full(direction)
+    ]
+
+
+def dashboard_data(recent=5):
+    agent_to_user = list_items_full("agent-to-user")
+    user_to_agent = list_items_full("user-to-agent")
+    current, history = list_statuses(source="kobito", recent=recent)
+    return {
+        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "decisions": [
+            item for item in agent_to_user if item.get("type") in DECISION_TYPES
+        ],
+        "notifications": [
+            item for item in agent_to_user if item.get("type") not in DECISION_TYPES
+        ],
+        "user_requests": user_to_agent,
+        "status_current": current,
+        "status_history": history,
+    }
+
+
+def respond_to_item(filename, decision):
+    if decision not in ("approval", "rejection"):
+        raise ValueError("decision must be approval or rejection")
+    item = get_item(filename, direction="agent-to-user")
+    if item.get("type") not in DECISION_TYPES:
+        raise ValueError("board item does not require a decision")
+
+    label = "承認" if decision == "approval" else "却下"
+    response_filename = add_item(
+        direction="user-to-agent",
+        from_="user",
+        type_=decision,
+        title=f"{label} (LINE経由): {item.get('title', '')}",
+        body=f"LINE Boardから{label}されました。",
+        related_links=item.get("related_links"),
+    )
+    complete_item(filename)
+    return response_filename
+
+
 def complete_item(filename):
+    filename = _safe_item_filename(filename)
     for direction in DIRECTIONS:
         path = direction_dir(direction) / filename
         if path.exists():
@@ -338,6 +401,31 @@ def _cmd_list(args):
 def _cmd_complete(args):
     direction = complete_item(args.filename)
     print(f"completed ({direction}): {args.filename}")
+
+
+def _cmd_get(args):
+    item = get_item(args.filename, direction=args.direction)
+    if args.json:
+        print(json.dumps(item, ensure_ascii=False))
+    else:
+        print(yaml.safe_dump(item, allow_unicode=True, sort_keys=False).rstrip())
+
+
+def _cmd_respond(args):
+    print(respond_to_item(args.filename, args.decision))
+
+
+def _cmd_dashboard(args):
+    data = dashboard_data(recent=args.recent)
+    if args.json:
+        print(json.dumps(data, ensure_ascii=False))
+        return
+    print(
+        f"判断待ち {len(data['decisions'])} / "
+        f"通知 {len(data['notifications'])} / "
+        f"ユーザー依頼 {len(data['user_requests'])} / "
+        f"kobito進行中 {len(data['status_current'])}"
+    )
 
 
 def _cmd_status_set(args):
@@ -378,6 +466,22 @@ def build_parser():
     complete_parser = subparsers.add_parser("complete", help="Mark an item as done")
     complete_parser.add_argument("filename")
     complete_parser.set_defaults(func=_cmd_complete)
+
+    get_parser = subparsers.add_parser("get", help="Show a board item")
+    get_parser.add_argument("filename")
+    get_parser.add_argument("--direction", choices=DIRECTIONS)
+    get_parser.add_argument("--json", action="store_true")
+    get_parser.set_defaults(func=_cmd_get)
+
+    respond_parser = subparsers.add_parser("respond", help="Approve or reject a decision item")
+    respond_parser.add_argument("filename")
+    respond_parser.add_argument("--decision", choices=("approval", "rejection"), required=True)
+    respond_parser.set_defaults(func=_cmd_respond)
+
+    dashboard_parser = subparsers.add_parser("dashboard", help="Show board dashboard data")
+    dashboard_parser.add_argument("--recent", type=int, default=5)
+    dashboard_parser.add_argument("--json", action="store_true")
+    dashboard_parser.set_defaults(func=_cmd_dashboard)
 
     status_parser = subparsers.add_parser("status", help="Manage agent work status")
     status_subparsers = status_parser.add_subparsers(dest="status_command", required=True)
