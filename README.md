@@ -21,6 +21,9 @@ board/
   agent-to-user/     # エージェント → ユーザーへの判断・確認・許可要求
   status/current/    # エージェントのissue単位の現在状態（同じissueは上書き）
   status/history/    # 完了・失敗した作業の直近履歴
+  runs/current/      # エージェント実行の開始・heartbeat
+  runs/history/      # 正常終了・異常終了した実行履歴
+  vm/events.jsonl    # ai-gateway fallback VMの作成・削除履歴
 ```
 
 各依頼は1ファイル1YAML（`board/<direction>/{タイムスタンプ}_{ランダムID}.yaml`）。処理が完了したファイルは削除する（履歴はgitのコミット履歴に残る）。
@@ -65,9 +68,17 @@ python board.py complete <filename>
 # kobitoの現在状態と直近5件の完了・失敗を表示
 python board.py status list --source kobito --recent 5
 
+# kobito自体の生存状態・停止疑い・連続失敗を表示
+python board.py run list --source kobito --recent 5
+
 # Claude/Codexの利用量履歴・タスク別差分を取得
 python board.py usage dashboard --hours 168
+
+# ai-gateway fallback VMの直近10件の操作履歴を取得
+python board.py vm list --recent 10
 ```
+
+`ai-gateway`の`spin-up-fallback-vm.sh`と`teardown-fallback-vm.sh`は、成功・失敗を`vm record`で自動記録する。これはスクリプト経由の操作のみを対象とし、GCP Consoleや直接実行した`gcloud`の操作は記録しない。
 
 Claudeは`scripts/claude_usage_statusline.py`をClaude CodeのstatusLineに設定すると、セッション中に5時間・7日枠を記録する。Codexは`scripts/collect_codex_usage.py`が公式app-serverプロトコルから現在値を記録する。`HUMAN_AGENT_WORK_ID=FEZ-123`を設定して実行するとissue単位の差分集計対象になる。Claudeの無操作期間など取得できない時間は推測で補完しない。
 
@@ -106,6 +117,7 @@ python board.py status set \
 状態は`waiting`、`researching`、`implementing`、`verifying`、`decision_pending`、`pr_open`、`completed`、`failed`のいずれか。同じ`source`と`work-id`の進行中状態は上書きされるため、古い途中経過が一覧に残らない。`completed`と`failed`は現在状態から取り除かれ、`status/history/`へ保存される。履歴ファイルは自動削除せず保持し、一覧・LINEでは既定で直近5件だけを表示する（`--recent`で表示件数を変更可能）。
 
 `--notify`を付けるとLINEにも状態を送る。状態通知には判断材料リンクを表示するが、承認・却下ボタンは付けない。通知過多を避けるため、通常は`decision_pending`、`pr_open`、`completed`、`failed`などユーザーに意味のある状態遷移だけで指定する。細かな途中経過はboardの状態だけを更新する。
+同じ`source`・`work-id`で直前と同じ`state`を再記録した場合は、履歴は保存するがLINE通知は重複送信しない。
 
 現在状態と直近履歴は次で確認できる。
 
@@ -114,6 +126,21 @@ python board.py status list --source kobito --recent 5
 ```
 
 現在状態はエージェントが更新するリアルタイム表示用のスナップショットであり、タスク・優先度・正式な完了状態の正本はLinear等のissueトラッカーとする。
+
+## 実行監視
+
+issue単位の`status`とは別に、定期実行そのものを`run`で記録する。`ai-gateway`はkobitoの受付時に`start`、実行中は60秒ごとに`heartbeat`、終了時に`finish`を自動実行する。
+
+```bash
+python board.py run start --source kobito --trigger cloud-scheduler
+python board.py run heartbeat --source kobito --run-id <run-id> --phase working
+python board.py run finish --source kobito --run-id <run-id> --outcome completed
+python board.py run list --source kobito --json
+```
+
+既定ではheartbeatが15分以上途絶えた実行を`stale`、最終確認が4時間以上前なら`missing`と判定する。`completed`・`no_work`は正常、`failed`・`blocked`は異常終了として履歴と連続失敗回数を表示する。
+
+同一障害のユーザー対応依頼には`add --dedupe-key <key>`を付ける。未解決の同じkeyがある場合は新規通知せず内容と更新時刻だけを更新する。復旧時は`resolve --direction agent-to-user --dedupe-key <key>`で解消する。
 
 ## テスト
 

@@ -10,6 +10,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 @pytest.fixture
 def board(tmp_path, monkeypatch):
+    # Never inherit real notification credentials in tests. Tests that verify
+    # delivery opt in with explicit fake values.
+    monkeypatch.delenv("LINE_CHANNEL_ACCESS_TOKEN", raising=False)
+    monkeypatch.delenv("LINE_NOTIFY_USER_ID", raising=False)
     monkeypatch.setenv("HUMAN_AGENT_BOARD_ROOT", str(tmp_path / "board"))
     import board as board_module
 
@@ -170,6 +174,107 @@ def test_dashboard_data_groups_board_items_and_status(board):
     assert [item["title"] for item in data["notifications"]] == ["notice"]
     assert [item["title"] for item in data["user_requests"]] == ["request"]
     assert data["status_current"][0]["work_id"] == "FEZ-112"
+    assert data["kobito_run"]["health"] == "missing"
+
+
+def test_run_lifecycle_reports_healthy_and_keeps_history(board):
+    started = board.start_run(
+        "kobito", trigger="cloud-scheduler", run_id="run-1",
+        started_at="2026-08-18T03:00:00Z",
+    )
+    assert started["state"] == "running"
+    board.heartbeat_run(
+        "kobito", "run-1", phase="working", summary="checking issues",
+        recorded_at="2026-08-18T03:01:00Z",
+    )
+    board.finish_run(
+        "kobito", "run-1", "completed", summary="pass completed",
+        finished_at="2026-08-18T03:02:00Z",
+    )
+
+    health = board.run_health(
+        "kobito", now=board.datetime.fromisoformat("2026-08-18T03:03:00+00:00").timestamp()
+    )
+
+    assert health["health"] == "healthy"
+    assert health["active"] == []
+    assert health["latest"]["summary"] == "pass completed"
+
+
+def test_run_health_detects_stale_and_consecutive_failures(board):
+    board.start_run(
+        "kobito", run_id="stuck", started_at="2026-08-18T00:00:00Z"
+    )
+    for index in range(2):
+        run_id = f"failed-{index}"
+        board.start_run(
+            "kobito", run_id=run_id,
+            started_at=f"2026-08-17T0{index}:00:00Z",
+        )
+        board.finish_run(
+            "kobito", run_id, "failed", finished_at=f"2026-08-17T0{index}:01:00Z"
+        )
+
+    health = board.run_health(
+        "kobito", stale_after=900, missing_after=14400,
+        now=board.datetime.fromisoformat("2026-08-18T01:00:00+00:00").timestamp(),
+    )
+
+    assert health["health"] == "stale"
+    assert health["active"][0]["stale"] is True
+    assert health["consecutive_failures"] == 2
+
+
+def test_add_dedupe_key_updates_one_item_and_resolve_removes_it(board, monkeypatch):
+    notifications = []
+    monkeypatch.setattr(board, "notify_line", lambda item, filename: notifications.append(filename))
+
+    first = board.add_item(
+        "agent-to-user", "kobito", "action_required", "Fix auth", "first",
+        dedupe_key="connectivity-preflight",
+    )
+    second = board.add_item(
+        "agent-to-user", "kobito", "action_required", "Fix auth", "second",
+        dedupe_key="connectivity-preflight",
+    )
+
+    assert first == second
+    assert len(board.list_items_full("agent-to-user")) == 1
+    assert board.get_item(first)["body"] == "second"
+    assert notifications == [first]
+    assert board.resolve_item("agent-to-user", "connectivity-preflight") == 1
+    assert board.list_items_full("agent-to-user") == []
+
+
+def test_record_and_list_vm_events_newest_first(board):
+    board.record_vm_event(
+        action="create", result="success", instance="vm-one",
+        project="sample-project", zone="asia-northeast1-a",
+        recorded_at="2026-08-18T05:00:00Z",
+    )
+    board.record_vm_event(
+        action="delete", result="failed", instance="vm-one",
+        project="sample-project", zone="asia-northeast1-a",
+        recorded_at="2026-08-18T06:00:00Z",
+    )
+
+    events = board.list_vm_events(recent=1)
+
+    assert events == [{
+        "action": "delete",
+        "result": "failed",
+        "instance": "vm-one",
+        "project": "sample-project",
+        "zone": "asia-northeast1-a",
+        "recorded_at": "2026-08-18T06:00:00Z",
+    }]
+
+
+def test_record_vm_event_rejects_unknown_values(board):
+    with pytest.raises(ValueError):
+        board.record_vm_event("start", "success", "vm", "project", "zone")
+    with pytest.raises(ValueError):
+        board.record_vm_event("create", "unknown", "vm", "project", "zone")
 
 
 def test_notify_line_noop_without_env(board, monkeypatch):
@@ -290,6 +395,27 @@ def test_status_notification_has_links_without_decision_buttons(board, monkeypat
     assert "[pr_open] PR is ready" in payload["messages"][0]["text"]
     assert "GitHub:" in payload["messages"][1]["text"]
     assert "Linear:" in payload["messages"][1]["text"]
+
+
+def test_repeated_status_state_does_not_notify_twice(board, monkeypatch):
+    monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "test-token")
+    monkeypatch.setenv("LINE_NOTIFY_USER_ID", "U1234")
+    calls = []
+    monkeypatch.setattr(
+        board.urllib.request, "urlopen", lambda request, timeout=None: calls.append(request)
+    )
+
+    for summary in ("first details", "same failure, reworded"):
+        board.set_status(
+            source="kobito",
+            work_id="connectivity-preflight",
+            state="failed",
+            title="preflight",
+            summary=summary,
+            notify=True,
+        )
+
+    assert len(calls) == 1
 
 
 def test_set_status_updates_current_snapshot(board):
