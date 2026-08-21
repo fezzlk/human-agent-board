@@ -72,9 +72,12 @@ def notify_line(item, filename):
 
     related_links = item.get("related_links") or []
     title = _truncate(item.get("title"), _LINE_TITLE_MAX)
-    text = _truncate(item.get("body"), _LINE_TEXT_MAX)
-
     requires_decision = item.get("type") in DECISION_TYPES
+    # LINE button templates allow only a short text field, but ordinary
+    # action/fyi notifications are regular text messages and should retain
+    # the diagnosis and recovery steps instead of becoming unactionable.
+    text_limit = _LINE_TEXT_MAX if requires_decision else _LINE_DETAILS_MAX
+    text = _truncate(item.get("body"), text_limit)
 
     if related_links and requires_decision:
         messages = [{

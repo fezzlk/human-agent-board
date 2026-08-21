@@ -369,6 +369,25 @@ def test_notify_line_without_related_links_sends_text_only(board, monkeypatch):
     assert payload["messages"] == [{"type": "text", "text": "status\nno approval required"}]
 
 
+def test_action_required_notification_keeps_recovery_details(board, monkeypatch):
+    monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "test-token")
+    monkeypatch.setenv("LINE_NOTIFY_USER_ID", "U1234")
+    calls = []
+    monkeypatch.setattr(
+        board.urllib.request, "urlopen",
+        lambda request, timeout=None: calls.append(request),
+    )
+    body = "原因: SSH接続失敗\n影響: 作業未実行\n対処: Tailscaleを確認\n再試行: 3時間後"
+
+    board.add_item(
+        direction="agent-to-user", from_="kobito", type_="action_required",
+        title="kobito障害", body=body,
+    )
+
+    payload = json.loads(calls[0].data)
+    assert body in payload["messages"][0]["text"]
+
+
 def test_status_notification_has_links_without_decision_buttons(board, monkeypatch):
     monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "test-token")
     monkeypatch.setenv("LINE_NOTIFY_USER_ID", "U1234")
