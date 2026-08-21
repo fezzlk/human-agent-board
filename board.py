@@ -8,6 +8,7 @@ import os
 import re
 import secrets
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -28,6 +29,7 @@ WORK_STATES = (
     "failed",
 )
 TERMINAL_WORK_STATES = ("completed", "failed")
+RUN_OUTCOMES = ("completed", "failed", "blocked", "no_work")
 DECISION_TYPES = ("approval_request", "decision_request", "plan_request")
 
 LINE_PUSH_URL = "https://api.line.me/v2/bot/message/push"
@@ -218,8 +220,187 @@ def status_history_dir() -> Path:
     return board_root() / "status" / "history"
 
 
+def run_current_dir() -> Path:
+    return board_root() / "runs" / "current"
+
+
+def run_history_dir() -> Path:
+    return board_root() / "runs" / "history"
+
+
+def _utc_now():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _run_path(source, run_id, current=True):
+    source = _safe_status_key(source, "source")
+    run_id = _safe_status_key(run_id, "run_id")
+    directory = run_current_dir() if current else run_history_dir()
+    return directory / f"{source}__{run_id}.yaml"
+
+
+def start_run(source, trigger="unknown", run_id=None, started_at=None):
+    run_id = run_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + secrets.token_hex(3)
+    now = started_at or _utc_now()
+    item = {
+        "source": _safe_status_key(source, "source"),
+        "run_id": _safe_status_key(run_id, "run_id"),
+        "state": "running",
+        "trigger": trigger,
+        "started_at": now,
+        "heartbeat_at": now,
+    }
+    path = _run_path(source, run_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        yaml.safe_dump(item, f, allow_unicode=True, sort_keys=False)
+    return item
+
+
+def heartbeat_run(source, run_id, phase=None, summary=None, recorded_at=None):
+    path = _run_path(source, run_id)
+    if not path.exists():
+        raise FileNotFoundError(f"active run not found: {source}/{run_id}")
+    with path.open(encoding="utf-8") as f:
+        item = yaml.safe_load(f) or {}
+    item["heartbeat_at"] = recorded_at or _utc_now()
+    if phase:
+        item["phase"] = phase
+    if summary:
+        item["summary"] = summary
+    with path.open("w", encoding="utf-8") as f:
+        yaml.safe_dump(item, f, allow_unicode=True, sort_keys=False)
+    return item
+
+
+def finish_run(source, run_id, outcome, summary=None, recovery=None, finished_at=None):
+    if outcome not in RUN_OUTCOMES:
+        raise ValueError(f"outcome must be one of: {', '.join(RUN_OUTCOMES)}")
+    current_path = _run_path(source, run_id)
+    if not current_path.exists():
+        raise FileNotFoundError(f"active run not found: {source}/{run_id}")
+    with current_path.open(encoding="utf-8") as f:
+        item = yaml.safe_load(f) or {}
+    now = finished_at or _utc_now()
+    item.update({"state": outcome, "heartbeat_at": now, "finished_at": now})
+    if summary:
+        item["summary"] = summary
+    if recovery:
+        item["recovery"] = recovery
+    history_path = _run_path(source, run_id, current=False)
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+    with history_path.open("w", encoding="utf-8") as f:
+        yaml.safe_dump(item, f, allow_unicode=True, sort_keys=False)
+    current_path.unlink()
+    return item
+
+
+def _load_runs(directory):
+    if not directory.exists():
+        return []
+    items = []
+    for path in directory.glob("*.yaml"):
+        with path.open(encoding="utf-8") as f:
+            item = yaml.safe_load(f) or {}
+        item["filename"] = path.name
+        items.append(item)
+    return sorted(items, key=lambda item: item.get("started_at", ""), reverse=True)
+
+
+def run_health(source, stale_after=900, missing_after=14400, recent=10, now=None):
+    now_ts = now if now is not None else time.time()
+    active = [item for item in _load_runs(run_current_dir()) if item.get("source") == source]
+    history = [item for item in _load_runs(run_history_dir()) if item.get("source") == source]
+    history = history[:recent]
+    stale = []
+    for item in active:
+        try:
+            heartbeat_ts = datetime.fromisoformat(item["heartbeat_at"].replace("Z", "+00:00")).timestamp()
+        except (KeyError, ValueError):
+            heartbeat_ts = 0
+        item["heartbeat_age_seconds"] = max(0, int(now_ts - heartbeat_ts))
+        item["stale"] = item["heartbeat_age_seconds"] > stale_after
+        if item["stale"]:
+            stale.append(item)
+    latest = history[0] if history else None
+    consecutive_failures = 0
+    for item in history:
+        if item.get("state") not in ("failed", "blocked"):
+            break
+        consecutive_failures += 1
+    last_seen_at = None
+    candidates = [i.get("heartbeat_at") for i in active] + [i.get("finished_at") for i in history]
+    candidates = [value for value in candidates if value]
+    if candidates:
+        last_seen_at = max(candidates)
+    missing = False
+    if last_seen_at:
+        last_seen_ts = datetime.fromisoformat(last_seen_at.replace("Z", "+00:00")).timestamp()
+        missing = now_ts - last_seen_ts > missing_after
+    if stale:
+        health = "stale"
+    elif active:
+        health = "running"
+    elif missing or not last_seen_at:
+        health = "missing"
+    elif consecutive_failures:
+        health = "degraded"
+    else:
+        health = "healthy"
+    return {
+        "source": source, "health": health, "last_seen_at": last_seen_at,
+        "consecutive_failures": consecutive_failures, "active": active,
+        "recent": history, "latest": latest,
+    }
+
+
 def usage_snapshots_path() -> Path:
     return board_root() / "usage" / "snapshots.jsonl"
+
+
+def vm_events_path() -> Path:
+    return board_root() / "vm" / "events.jsonl"
+
+
+def record_vm_event(action, result, instance, project, zone, recorded_at=None):
+    if action not in ("create", "delete"):
+        raise ValueError("action must be create or delete")
+    if result not in ("success", "failed"):
+        raise ValueError("result must be success or failed")
+    item = {
+        "action": action,
+        "result": result,
+        "instance": instance,
+        "project": project,
+        "zone": zone,
+        "recorded_at": recorded_at
+        or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    path = vm_events_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(item, ensure_ascii=False) + "\n")
+    return item
+
+
+def list_vm_events(recent=10):
+    if recent < 1:
+        raise ValueError("recent must be at least 1")
+    path = vm_events_path()
+    if not path.exists():
+        return []
+    items = []
+    with path.open(encoding="utf-8") as f:
+        for line in f:
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if all(key in item for key in ("action", "result", "instance", "recorded_at")):
+                items.append(item)
+    # JSONL append order is authoritative. Timestamps only have second
+    # precision, so sorting them can misorder a rapid create/delete pair.
+    return list(reversed(items))[:recent]
 
 
 def record_usage(provider, primary_used, secondary_used=None,
@@ -336,6 +517,18 @@ def set_status(source, work_id, state, title, summary, next_action=None,
         item["related_links"] = list(related_links)
 
     current_path = _status_path(source, work_id)
+    previous = []
+    if current_path.exists():
+        previous.extend(_load_status_files(current_path.parent))
+    previous.extend(_load_status_files(status_history_dir()))
+    previous_state = next(
+        (
+            entry.get("state")
+            for entry in previous
+            if entry.get("source") == source and entry.get("work_id") == work_id
+        ),
+        None,
+    )
     if state in TERMINAL_WORK_STATES:
         directory = status_history_dir()
         directory.mkdir(parents=True, exist_ok=True)
@@ -352,7 +545,9 @@ def set_status(source, work_id, state, title, summary, next_action=None,
     with path.open("w", encoding="utf-8") as f:
         yaml.safe_dump(item, f, allow_unicode=True, sort_keys=False)
 
-    if notify:
+    # Preserve repeated unattended results in history, but alert only when the
+    # state changes. Reworded copies of the same failure should not spam LINE.
+    if notify and previous_state != state:
         notify_line(
             {
                 "type": "status_update",
@@ -414,11 +609,30 @@ def format_status_list(source=None, recent=5):
     return "\n\n".join(sections)
 
 
-def add_item(direction, from_, type_, title, body, related_links=None):
+def add_item(direction, from_, type_, title, body, related_links=None, dedupe_key=None):
     directory = direction_dir(direction)
     directory.mkdir(parents=True, exist_ok=True)
 
     now = datetime.now(timezone.utc)
+    if dedupe_key:
+        dedupe_key = _safe_status_key(dedupe_key, "dedupe_key")
+        existing = next(
+            (item for item in list_items_full(direction) if item.get("dedupe_key") == dedupe_key),
+            None,
+        )
+        if existing:
+            path = directory / existing["filename"]
+            existing.update({
+                "from": from_, "type": type_, "title": title, "body": body,
+                "updated_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            })
+            existing.pop("filename", None)
+            existing.pop("direction", None)
+            if related_links:
+                existing["related_links"] = list(related_links)
+            with path.open("w", encoding="utf-8") as f:
+                yaml.safe_dump(existing, f, allow_unicode=True, sort_keys=False)
+            return path.name
     filename = f"{now.strftime('%Y%m%dT%H%M%SZ')}_{secrets.token_hex(3)}.yaml"
     path = directory / filename
 
@@ -431,6 +645,8 @@ def add_item(direction, from_, type_, title, body, related_links=None):
     }
     if related_links:
         item["related_links"] = list(related_links)
+    if dedupe_key:
+        item["dedupe_key"] = dedupe_key
 
     with path.open("w", encoding="utf-8") as f:
         yaml.safe_dump(item, f, allow_unicode=True, sort_keys=False)
@@ -439,6 +655,14 @@ def add_item(direction, from_, type_, title, body, related_links=None):
         notify_line(item, filename)
 
     return filename
+
+
+def resolve_item(direction, dedupe_key):
+    dedupe_key = _safe_status_key(dedupe_key, "dedupe_key")
+    matches = [item for item in list_items_full(direction) if item.get("dedupe_key") == dedupe_key]
+    for item in matches:
+        (direction_dir(direction) / item["filename"]).unlink()
+    return len(matches)
 
 
 def _safe_item_filename(filename):
@@ -492,6 +716,14 @@ def dashboard_data(recent=5):
     agent_to_user = list_items_full("agent-to-user")
     user_to_agent = list_items_full("user-to-agent")
     current, history = list_statuses(source="kobito", recent=recent)
+    now_ts = time.time()
+    for item in current:
+        try:
+            updated_ts = datetime.fromisoformat(item["updated_at"].replace("Z", "+00:00")).timestamp()
+            item["age_seconds"] = max(0, int(now_ts - updated_ts))
+            item["stale"] = item["age_seconds"] > 14400
+        except (KeyError, ValueError):
+            item["stale"] = True
     return {
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "decisions": [
@@ -503,6 +735,7 @@ def dashboard_data(recent=5):
         "user_requests": user_to_agent,
         "status_current": current,
         "status_history": history,
+        "kobito_run": run_health("kobito", recent=recent),
     }
 
 
@@ -544,6 +777,7 @@ def _cmd_add(args):
         title=args.title,
         body=args.body,
         related_links=args.related_link,
+        dedupe_key=args.dedupe_key,
     )
     print(filename)
 
@@ -560,6 +794,11 @@ def _cmd_list(args):
 def _cmd_complete(args):
     direction = complete_item(args.filename)
     print(f"completed ({direction}): {args.filename}")
+
+
+def _cmd_resolve(args):
+    count = resolve_item(args.direction, args.dedupe_key)
+    print(f"resolved: {count}")
 
 
 def _cmd_get(args):
@@ -583,8 +822,34 @@ def _cmd_dashboard(args):
         f"判断待ち {len(data['decisions'])} / "
         f"通知 {len(data['notifications'])} / "
         f"ユーザー依頼 {len(data['user_requests'])} / "
+        f"kobito {data['kobito_run']['health']} / "
         f"kobito進行中 {len(data['status_current'])}"
     )
+
+
+def _cmd_run_start(args):
+    print(json.dumps(start_run(args.source, trigger=args.trigger), ensure_ascii=False))
+
+
+def _cmd_run_heartbeat(args):
+    print(json.dumps(heartbeat_run(args.source, args.run_id, args.phase, args.summary), ensure_ascii=False))
+
+
+def _cmd_run_finish(args):
+    print(json.dumps(finish_run(args.source, args.run_id, args.outcome, args.summary, args.recovery), ensure_ascii=False))
+
+
+def _cmd_run_list(args):
+    data = run_health(args.source, args.stale_after, args.missing_after, args.recent)
+    if args.json:
+        print(json.dumps(data, ensure_ascii=False))
+        return
+    print(f"{args.source}: {data['health']} / 最終確認: {data['last_seen_at'] or 'なし'} / 連続失敗: {data['consecutive_failures']}")
+    for item in data["active"]:
+        suffix = " (停止疑い)" if item.get("stale") else ""
+        print(f"  running {item['run_id']} heartbeat={item.get('heartbeat_at', '?')}{suffix}")
+    for item in data["recent"]:
+        print(f"  {item.get('state', '?')} {item.get('run_id', '?')} finished={item.get('finished_at', '?')} {item.get('summary', '')}")
 
 
 def _cmd_usage_record(args):
@@ -602,6 +867,31 @@ def _cmd_usage_record(args):
 
 def _cmd_usage_dashboard(args):
     print(json.dumps(usage_dashboard(hours=args.hours), ensure_ascii=False))
+
+
+def _cmd_vm_record(args):
+    item = record_vm_event(
+        action=args.action,
+        result=args.result,
+        instance=args.instance,
+        project=args.project,
+        zone=args.zone,
+    )
+    print(json.dumps(item, ensure_ascii=False))
+
+
+def _cmd_vm_list(args):
+    items = list_vm_events(recent=args.recent)
+    if args.json:
+        print(json.dumps(items, ensure_ascii=False))
+        return
+    labels = {"create": "起動（作成）", "delete": "停止（削除）"}
+    for item in items:
+        print(
+            f"{item['recorded_at']}\t{labels[item['action']]}\t"
+            f"{item['result']}\t{item['instance']}\t"
+            f"{item.get('project', '?')}/{item.get('zone', '?')}"
+        )
 
 
 def _cmd_status_set(args):
@@ -639,6 +929,7 @@ def build_parser():
     add_parser.add_argument("--title", required=True)
     add_parser.add_argument("--body", required=True)
     add_parser.add_argument("--related-link", action="append", default=None)
+    add_parser.add_argument("--dedupe-key")
     add_parser.set_defaults(func=_cmd_add)
 
     list_parser = subparsers.add_parser("list", help="List pending items")
@@ -648,6 +939,11 @@ def build_parser():
     complete_parser = subparsers.add_parser("complete", help="Mark an item as done")
     complete_parser.add_argument("filename")
     complete_parser.set_defaults(func=_cmd_complete)
+
+    resolve_parser = subparsers.add_parser("resolve", help="Resolve items by stable dedupe key")
+    resolve_parser.add_argument("--direction", choices=DIRECTIONS, required=True)
+    resolve_parser.add_argument("--dedupe-key", required=True)
+    resolve_parser.set_defaults(func=_cmd_resolve)
 
     get_parser = subparsers.add_parser("get", help="Show a board item")
     get_parser.add_argument("filename")
@@ -665,6 +961,33 @@ def build_parser():
     dashboard_parser.add_argument("--json", action="store_true")
     dashboard_parser.set_defaults(func=_cmd_dashboard)
 
+    run_parser = subparsers.add_parser("run", help="Track autonomous agent executions")
+    run_subparsers = run_parser.add_subparsers(dest="run_command", required=True)
+    run_start_parser = run_subparsers.add_parser("start")
+    run_start_parser.add_argument("--source", required=True)
+    run_start_parser.add_argument("--trigger", default="unknown")
+    run_start_parser.set_defaults(func=_cmd_run_start)
+    run_heartbeat_parser = run_subparsers.add_parser("heartbeat")
+    run_heartbeat_parser.add_argument("--source", required=True)
+    run_heartbeat_parser.add_argument("--run-id", required=True)
+    run_heartbeat_parser.add_argument("--phase")
+    run_heartbeat_parser.add_argument("--summary")
+    run_heartbeat_parser.set_defaults(func=_cmd_run_heartbeat)
+    run_finish_parser = run_subparsers.add_parser("finish")
+    run_finish_parser.add_argument("--source", required=True)
+    run_finish_parser.add_argument("--run-id", required=True)
+    run_finish_parser.add_argument("--outcome", choices=RUN_OUTCOMES, required=True)
+    run_finish_parser.add_argument("--summary")
+    run_finish_parser.add_argument("--recovery")
+    run_finish_parser.set_defaults(func=_cmd_run_finish)
+    run_list_parser = run_subparsers.add_parser("list")
+    run_list_parser.add_argument("--source", required=True)
+    run_list_parser.add_argument("--recent", type=int, default=5)
+    run_list_parser.add_argument("--stale-after", type=int, default=900)
+    run_list_parser.add_argument("--missing-after", type=int, default=14400)
+    run_list_parser.add_argument("--json", action="store_true")
+    run_list_parser.set_defaults(func=_cmd_run_list)
+
     usage_parser = subparsers.add_parser("usage", help="Record and summarize plan usage")
     usage_subparsers = usage_parser.add_subparsers(dest="usage_command", required=True)
     usage_record_parser = usage_subparsers.add_parser("record", help="Record a usage snapshot")
@@ -679,6 +1002,20 @@ def build_parser():
     usage_dashboard_parser = usage_subparsers.add_parser("dashboard", help="Show usage history")
     usage_dashboard_parser.add_argument("--hours", type=int, default=720)
     usage_dashboard_parser.set_defaults(func=_cmd_usage_dashboard)
+
+    vm_parser = subparsers.add_parser("vm", help="Record and list fallback VM events")
+    vm_subparsers = vm_parser.add_subparsers(dest="vm_command", required=True)
+    vm_record_parser = vm_subparsers.add_parser("record", help="Record a VM lifecycle event")
+    vm_record_parser.add_argument("--action", choices=("create", "delete"), required=True)
+    vm_record_parser.add_argument("--result", choices=("success", "failed"), required=True)
+    vm_record_parser.add_argument("--instance", required=True)
+    vm_record_parser.add_argument("--project", required=True)
+    vm_record_parser.add_argument("--zone", required=True)
+    vm_record_parser.set_defaults(func=_cmd_vm_record)
+    vm_list_parser = vm_subparsers.add_parser("list", help="List recent VM lifecycle events")
+    vm_list_parser.add_argument("--recent", type=int, default=10)
+    vm_list_parser.add_argument("--json", action="store_true")
+    vm_list_parser.set_defaults(func=_cmd_vm_list)
 
     status_parser = subparsers.add_parser("status", help="Manage agent work status")
     status_subparsers = status_parser.add_subparsers(dest="status_command", required=True)
