@@ -114,7 +114,9 @@ python board.py status set \
   --related-link "https://linear.app/example/issue/FEZ-111/example"
 ```
 
-状態は`waiting`、`researching`、`implementing`、`verifying`、`decision_pending`、`pr_open`、`completed`、`failed`のいずれか。同じ`source`と`work-id`の進行中状態は上書きされるため、古い途中経過が一覧に残らない。`completed`と`failed`は現在状態から取り除かれ、`status/history/`へ保存される。履歴ファイルは自動削除せず保持し、一覧・LINEでは既定で直近5件だけを表示する（`--recent`で表示件数を変更可能）。
+状態は`waiting`、`researching`、`implementing`、`verifying`、`decision_pending`、`pr_open`、`completed`、`failed`、`stale`のいずれか。同じ`source`と`work-id`の進行中状態は上書きされるため、古い途中経過が一覧に残らない。`completed`、`failed`、`stale`は現在状態から取り除かれ、`status/history/`へ保存される。履歴ファイルは自動削除せず保持し、一覧・LINEでは既定で直近5件だけを表示する（`--recent`で表示件数を変更可能）。
+
+kobitoの新しいrun開始時、同じsourceの実行中runがなければ、4時間以上更新されていない`researching`・`implementing`・`verifying`を`stale`として履歴へ自動退避する。`decision_pending`・`pr_open`は人間の応答待ちとして現在状態に残す。別runが実行中の場合は長時間作業を誤って退避しないため、この整理を行わない。
 
 `--notify`を付けるとLINEにも状態を送る。状態通知には判断材料リンクを表示するが、承認・却下ボタンは付けない。通知過多を避けるため、通常は`decision_pending`、`pr_open`、`completed`、`failed`などユーザーに意味のある状態遷移だけで指定する。細かな途中経過はboardの状態だけを更新する。
 同じ`source`・`work-id`で直前と同じ`state`を再記録した場合は、履歴は保存するがLINE通知は重複送信しない。
