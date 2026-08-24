@@ -27,8 +27,10 @@ WORK_STATES = (
     "pr_open",
     "completed",
     "failed",
+    "stale",
 )
-TERMINAL_WORK_STATES = ("completed", "failed")
+TERMINAL_WORK_STATES = ("completed", "failed", "stale")
+STALEABLE_WORK_STATES = ("researching", "implementing", "verifying")
 RUN_OUTCOMES = ("completed", "failed", "blocked", "no_work")
 DECISION_TYPES = ("approval_request", "decision_request", "plan_request")
 
@@ -61,6 +63,14 @@ def _format_related_links(related_links):
     return _truncate("\n".join(lines), _LINE_DETAILS_MAX)
 
 
+def _line_decision_target(item):
+    for url in item.get("related_links") or []:
+        match = re.search(r"/issue/([A-Za-z]+-\d+)(?:/|$)", url)
+        if match:
+            return match.group(1).upper()
+    return _truncate(item.get("title") or "この依頼", 30)
+
+
 def notify_line(item, filename):
     """Best-effort LINE push for a new agent-to-user item. No-op if the LINE
     env vars aren't configured, and never raises -- a notification failure
@@ -80,6 +90,7 @@ def notify_line(item, filename):
     text = _truncate(item.get("body"), text_limit)
 
     if related_links and requires_decision:
+        decision_target = _line_decision_target(item)
         messages = [{
             "type": "template",
             "altText": title or "human-agent-board",
@@ -91,12 +102,14 @@ def notify_line(item, filename):
                     {
                         "type": "postback",
                         "label": "承認",
-                        "data": f"approve|{related_links[0]}",
+                        "data": f"board|approve|{filename}",
+                        "displayText": f"{decision_target}を承認",
                     },
                     {
                         "type": "postback",
                         "label": "却下",
-                        "data": f"reject|{related_links[0]}",
+                        "data": f"board|reject|{filename}",
+                        "displayText": f"{decision_target}を却下",
                     },
                 ],
             },
@@ -243,6 +256,12 @@ def _run_path(source, run_id, current=True):
 
 
 def start_run(source, trigger="unknown", run_id=None, started_at=None):
+    active_for_source = [
+        item for item in _load_runs(run_current_dir())
+        if item.get("source") == source
+    ]
+    if not active_for_source:
+        archive_stale_statuses(source, stale_after=14400)
     run_id = run_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + secrets.token_hex(3)
     now = started_at or _utc_now()
     item = {
@@ -500,6 +519,56 @@ def _status_path(source, work_id):
     return status_current_dir() / f"{source}__{work_id}.yaml"
 
 
+def archive_stale_statuses(source, stale_after=14400, now=None):
+    """Move abandoned active-work snapshots to history before a new run.
+
+    Waiting-for-user states remain current because their age does not mean the
+    worker abandoned them. If another run is active, start_run skips this
+    reconciliation so a long-running task is not archived underneath it.
+    """
+    if stale_after < 1:
+        raise ValueError("stale_after must be at least 1")
+    source = _safe_status_key(source, "source")
+    now_ts = now if now is not None else time.time()
+    archived = []
+    for item in _load_status_files(status_current_dir()):
+        if item.get("source") != source or item.get("state") not in STALEABLE_WORK_STATES:
+            continue
+        try:
+            updated_ts = datetime.fromisoformat(
+                item["updated_at"].replace("Z", "+00:00")
+            ).timestamp()
+        except (KeyError, TypeError, ValueError):
+            continue
+        age_seconds = max(0, int(now_ts - updated_ts))
+        if age_seconds <= stale_after:
+            continue
+
+        current_path = _status_path(source, item["work_id"])
+        if not current_path.exists():
+            continue
+        original_state = item["state"]
+        item.update({
+            "state": "stale",
+            "previous_state": original_state,
+            "archived_at": datetime.fromtimestamp(now_ts, timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            ),
+            "age_seconds": age_seconds,
+        })
+        directory = status_history_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        history_path = directory / (
+            f"{datetime.fromtimestamp(now_ts, timezone.utc).strftime('%Y%m%dT%H%M%SZ')}_"
+            f"{source}__{item['work_id']}_{secrets.token_hex(3)}.yaml"
+        )
+        with history_path.open("w", encoding="utf-8") as f:
+            yaml.safe_dump(item, f, allow_unicode=True, sort_keys=False)
+        current_path.unlink()
+        archived.append(item)
+    return archived
+
+
 def set_status(source, work_id, state, title, summary, next_action=None,
                related_links=None, notify=False):
     if state not in WORK_STATES:
@@ -724,9 +793,12 @@ def dashboard_data(recent=5):
         try:
             updated_ts = datetime.fromisoformat(item["updated_at"].replace("Z", "+00:00")).timestamp()
             item["age_seconds"] = max(0, int(now_ts - updated_ts))
-            item["stale"] = item["age_seconds"] > 14400
+            item["stale"] = (
+                item.get("state") in STALEABLE_WORK_STATES
+                and item["age_seconds"] > 14400
+            )
         except (KeyError, ValueError):
-            item["stale"] = True
+            item["stale"] = item.get("state") in STALEABLE_WORK_STATES
     return {
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "decisions": [

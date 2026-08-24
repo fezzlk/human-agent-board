@@ -139,7 +139,7 @@ def test_respond_rejects_non_decision_item(board):
 
 
 def test_dashboard_data_groups_board_items_and_status(board):
-    board.add_item(
+    filename = board.add_item(
         direction="agent-to-user",
         from_="kobito",
         type_="decision_request",
@@ -177,6 +177,26 @@ def test_dashboard_data_groups_board_items_and_status(board):
     assert data["kobito_run"]["health"] == "missing"
 
 
+def test_dashboard_does_not_mark_waiting_states_stale(board, monkeypatch):
+    monkeypatch.setattr(board.time, "time", lambda: 1_755_510_400)
+    for work_id, state in (("FEZ-PR", "pr_open"), ("FEZ-DECISION", "decision_pending")):
+        board.set_status(
+            source="kobito", work_id=work_id, state=state,
+            title=work_id, summary="waiting for user",
+        )
+        path = board._status_path("kobito", work_id)
+        item = board.yaml.safe_load(path.read_text(encoding="utf-8"))
+        item["updated_at"] = "2025-08-17T00:00:00Z"
+        path.write_text(
+            board.yaml.safe_dump(item, allow_unicode=True, sort_keys=False),
+            encoding="utf-8",
+        )
+
+    data = board.dashboard_data()
+
+    assert all(item["stale"] is False for item in data["status_current"])
+
+
 def test_run_lifecycle_reports_healthy_and_keeps_history(board):
     started = board.start_run(
         "kobito", trigger="cloud-scheduler", run_id="run-1",
@@ -199,6 +219,64 @@ def test_run_lifecycle_reports_healthy_and_keeps_history(board):
     assert health["health"] == "healthy"
     assert health["active"] == []
     assert health["latest"]["summary"] == "pass completed"
+
+
+def test_start_run_archives_only_stale_active_work_statuses(board, monkeypatch):
+    monkeypatch.setattr(board.time, "time", lambda: 1_755_510_400)
+    old_updated_at = "2025-08-17T00:00:00Z"
+    for work_id, state in (
+        ("FEZ-OLD", "implementing"),
+        ("FEZ-PR", "pr_open"),
+        ("FEZ-DECISION", "decision_pending"),
+    ):
+        board.set_status(
+            source="kobito", work_id=work_id, state=state,
+            title=work_id, summary="status",
+        )
+        path = board._status_path("kobito", work_id)
+        item = board.yaml.safe_load(path.read_text(encoding="utf-8"))
+        item["updated_at"] = old_updated_at
+        path.write_text(
+            board.yaml.safe_dump(item, allow_unicode=True, sort_keys=False),
+            encoding="utf-8",
+        )
+
+    board.start_run(
+        "kobito", run_id="run-prunes-stale",
+        started_at="2026-08-18T03:00:00Z",
+    )
+
+    current, history = board.list_statuses(source="kobito", recent=10)
+    assert {item["work_id"] for item in current} == {"FEZ-PR", "FEZ-DECISION"}
+    archived = next(item for item in history if item["work_id"] == "FEZ-OLD")
+    assert archived["state"] == "stale"
+    assert archived["previous_state"] == "implementing"
+
+
+def test_start_run_does_not_archive_status_while_another_run_is_active(board, monkeypatch):
+    monkeypatch.setattr(board.time, "time", lambda: 1_755_510_400)
+    board.start_run(
+        "kobito", run_id="existing-run",
+        started_at="2026-08-18T02:00:00Z",
+    )
+    board.set_status(
+        source="kobito", work_id="FEZ-LONG", state="researching",
+        title="long task", summary="still running",
+    )
+    path = board._status_path("kobito", "FEZ-LONG")
+    item = board.yaml.safe_load(path.read_text(encoding="utf-8"))
+    item["updated_at"] = "2025-08-17T00:00:00Z"
+    path.write_text(
+        board.yaml.safe_dump(item, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+    board.start_run(
+        "kobito", run_id="overlapping-run",
+        started_at="2026-08-18T03:00:00Z",
+    )
+
+    current, _ = board.list_statuses(source="kobito", recent=10)
+    assert [item["work_id"] for item in current] == ["FEZ-LONG"]
 
 
 def test_run_health_detects_stale_and_consecutive_failures(board):
@@ -316,7 +394,7 @@ def test_notify_line_pushes_buttons_and_related_links_when_configured(board, mon
 
     monkeypatch.setattr(board.urllib.request, "urlopen", fake_urlopen)
 
-    board.add_item(
+    filename = board.add_item(
         direction="agent-to-user",
         from_="kobito",
         type_="plan_request",
@@ -334,12 +412,10 @@ def test_notify_line_pushes_buttons_and_related_links_when_configured(board, mon
     assert payload["to"] == "U1234"
     assert len(payload["messages"]) == 2
     template = payload["messages"][0]["template"]
-    assert template["actions"][0]["data"] == (
-        "approve|https://github.com/fezzlk/human-agent-board/pull/1"
-    )
-    assert template["actions"][1]["data"] == (
-        "reject|https://github.com/fezzlk/human-agent-board/pull/1"
-    )
+    assert template["actions"][0]["data"] == f"board|approve|{filename}"
+    assert template["actions"][1]["data"] == f"board|reject|{filename}"
+    assert template["actions"][0]["displayText"] == "FEZ-110を承認"
+    assert template["actions"][1]["displayText"] == "FEZ-110を却下"
     details = payload["messages"][1]
     assert details["type"] == "text"
     assert "GitHub: https://github.com/fezzlk/human-agent-board/pull/1" in details["text"]
