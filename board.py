@@ -3,11 +3,18 @@
 user and AI coding agents (Claude Code, Codex, etc.)."""
 
 import argparse
+import fcntl
+import functools
+import hashlib
 import json
 import os
 import re
 import secrets
+import shlex
+import subprocess
 import sys
+import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -36,6 +43,110 @@ LINE_PUSH_URL = "https://api.line.me/v2/bot/message/push"
 _LINE_TITLE_MAX = 40
 _LINE_TEXT_MAX = 60
 _LINE_DETAILS_MAX = 5000
+_QUEUE_MUTEX = threading.RLock()
+_QUEUE_LOCAL = threading.local()
+
+
+def _project_id(value=None):
+    context = os.environ.get("KOBITO_PROJECT_ID") or None
+    if value and context and value != context:
+        raise ValueError("project ID differs from execution context")
+    value = value or context
+    if value and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", value):
+        raise ValueError("invalid project ID")
+    return value
+
+
+def _thread_ts(value=None):
+    value = value or os.environ.get("KOBITO_SLACK_THREAD_TS")
+    if value and not re.fullmatch(r"[0-9]+\.[0-9]+", value):
+        raise ValueError("invalid Slack thread timestamp")
+    return value
+
+
+def _queue_write(func):
+    @functools.wraps(func)
+    def wrapped(*args, **kwargs):
+        with _QUEUE_MUTEX:
+            if getattr(_QUEUE_LOCAL, "active", False):
+                return func(*args, **kwargs)
+            lock_path = board_root() / "state" / ".queue.lock"
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            with lock_path.open("a+") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                _QUEUE_LOCAL.active = True
+                try:
+                    return func(*args, **kwargs)
+                finally:
+                    _QUEUE_LOCAL.active = False
+                    fcntl.flock(lock, fcntl.LOCK_UN)
+    return wrapped
+
+
+def decision_digest(item):
+    values = {key: item.get(key) for key in (
+        "project_id", "type", "title", "body", "related_links", "created_at", "slack_thread_ts"
+    )}
+    return hashlib.sha256(json.dumps(values, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
+def _atomic_text(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode="w", dir=str(path.parent), encoding="utf-8", delete=False) as output:
+        temp = Path(output.name)
+        output.write(text)
+        output.flush()
+        os.fsync(output.fileno())
+    try:
+        temp.replace(path)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+def notify_item(item, filename):
+    backend = os.environ.get("HUMAN_AGENT_NOTIFICATION_BACKEND", "line")
+    if backend == "line":
+        return notify_line(item, filename)
+    if backend == "none":
+        return
+    if backend != "command":
+        print("notification backend is invalid", file=sys.stderr)
+        return
+    payload = json.dumps({"item": item, "filename": filename}, ensure_ascii=False)
+    notification_id = hashlib.sha256(payload.encode()).hexdigest()
+    pending = board_root() / "state" / "notifications" / (notification_id + ".json")
+    _atomic_text(pending, payload)
+    command = os.environ.get("HUMAN_AGENT_NOTIFICATION_COMMAND", "")
+    if not command:
+        print("notification command is not configured", file=sys.stderr)
+        return
+    try:
+        completed = subprocess.run(
+            shlex.split(command),
+            input=payload,
+            text=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60,
+        )
+        if completed.returncode:
+            print("notification command failed; board item is retained", file=sys.stderr)
+        else:
+            pending.unlink(missing_ok=True)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        print("notification command unavailable; board item is retained", file=sys.stderr)
+
+
+def pending_notifications():
+    directory = board_root() / "state" / "notifications"
+    result = []
+    for path in sorted(directory.glob("*.json")):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        result.append({"id": path.stem, **payload})
+    return result
+
+
+def complete_notification(notification_id):
+    if not re.fullmatch(r"[0-9a-f]{64}", notification_id):
+        raise ValueError("invalid notification ID")
+    (board_root() / "state" / "notifications" / (notification_id + ".json")).unlink(missing_ok=True)
 
 
 def _truncate(text, limit):
@@ -255,8 +366,7 @@ def start_run(source, trigger="unknown", run_id=None, started_at=None):
     }
     path = _run_path(source, run_id)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        yaml.safe_dump(item, f, allow_unicode=True, sort_keys=False)
+    _atomic_text(path, yaml.safe_dump(item, allow_unicode=True, sort_keys=False))
     return item
 
 
@@ -500,8 +610,9 @@ def _status_path(source, work_id):
     return status_current_dir() / f"{source}__{work_id}.yaml"
 
 
+@_queue_write
 def set_status(source, work_id, state, title, summary, next_action=None,
-               related_links=None, notify=False):
+               related_links=None, notify=False, project_id=None, thread_ts=None):
     if state not in WORK_STATES:
         raise ValueError(f"state must be one of: {', '.join(WORK_STATES)}")
 
@@ -514,6 +625,12 @@ def set_status(source, work_id, state, title, summary, next_action=None,
         "summary": summary,
         "updated_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
+    project_id = _project_id(project_id)
+    if project_id:
+        item["project_id"] = project_id
+    thread_ts = _thread_ts(thread_ts)
+    if thread_ts:
+        item["slack_thread_ts"] = thread_ts
     if next_action:
         item["next_action"] = next_action
     if related_links:
@@ -522,6 +639,10 @@ def set_status(source, work_id, state, title, summary, next_action=None,
     current_path = _status_path(source, work_id)
     previous = []
     if current_path.exists():
+        with current_path.open(encoding="utf-8") as f:
+            existing = yaml.safe_load(f) or {}
+        if existing.get("project_id") != project_id:
+            raise ValueError("current work status belongs to a different project scope")
         previous.extend(_load_status_files(current_path.parent))
     previous.extend(_load_status_files(status_history_dir()))
     previous_state = next(
@@ -529,6 +650,7 @@ def set_status(source, work_id, state, title, summary, next_action=None,
             entry.get("state")
             for entry in previous
             if entry.get("source") == source and entry.get("work_id") == work_id
+            and entry.get("project_id") == project_id
         ),
         None,
     )
@@ -551,12 +673,14 @@ def set_status(source, work_id, state, title, summary, next_action=None,
     # Preserve repeated unattended results in history, but alert only when the
     # state changes. Reworded copies of the same failure should not spam LINE.
     if notify and previous_state != state:
-        notify_line(
+        notify_item(
             {
                 "type": "status_update",
                 "title": f"{work_id}: {title}",
                 "body": f"[{state}] {summary}",
                 "related_links": item.get("related_links", []),
+                **({"project_id": project_id} if project_id else {}),
+                **({"slack_thread_ts": thread_ts} if thread_ts else {}),
             },
             path.name,
         )
@@ -576,9 +700,13 @@ def _load_status_files(directory):
     return items
 
 
-def list_statuses(source=None, recent=5):
+def list_statuses(source=None, recent=5, project_id=None):
     current = _load_status_files(status_current_dir())
     history = _load_status_files(status_history_dir())
+    project_id = _project_id(project_id)
+    if project_id:
+        current = [item for item in current if item.get("project_id") == project_id]
+        history = [item for item in history if item.get("project_id") == project_id]
     if source:
         current = [item for item in current if item.get("source") == source]
         history = [item for item in history if item.get("source") == source]
@@ -612,7 +740,28 @@ def format_status_list(source=None, recent=5):
     return "\n\n".join(sections)
 
 
-def add_item(direction, from_, type_, title, body, related_links=None, dedupe_key=None):
+@_queue_write
+def add_item(direction, from_, type_, title, body, related_links=None, dedupe_key=None,
+             project_id=None, external_id=None, thread_ts=None):
+    project_id = _project_id(project_id)
+    thread_ts = _thread_ts(thread_ts)
+    if external_id:
+        external_id = _safe_status_key(external_id, "external_id")
+        receipt = board_root() / "state" / "external-items" / (external_id + ".json")
+        if receipt.exists():
+            saved = json.loads(receipt.read_text(encoding="utf-8"))
+            if saved.get("project_id") != project_id or saved.get("direction") != direction:
+                raise ValueError("external event belongs to another scope")
+            return saved["filename"]
+        # Recover a crash after the YAML commit but before its receipt.
+        existing = next((item for item in list_items_full(direction, project_id=project_id)
+                         if item.get("external_id") == external_id), None)
+        if existing:
+            receipt.parent.mkdir(parents=True, exist_ok=True)
+            _atomic_text(receipt, json.dumps({
+                "project_id": project_id, "direction": direction, "filename": existing["filename"],
+            }))
+            return existing["filename"]
     directory = direction_dir(direction)
     directory.mkdir(parents=True, exist_ok=True)
 
@@ -620,7 +769,8 @@ def add_item(direction, from_, type_, title, body, related_links=None, dedupe_ke
     if dedupe_key:
         dedupe_key = _safe_status_key(dedupe_key, "dedupe_key")
         existing = next(
-            (item for item in list_items_full(direction) if item.get("dedupe_key") == dedupe_key),
+            (item for item in list_items_full(direction, project_id=project_id)
+             if item.get("project_id") == project_id and item.get("dedupe_key") == dedupe_key),
             None,
         )
         if existing:
@@ -633,8 +783,9 @@ def add_item(direction, from_, type_, title, body, related_links=None, dedupe_ke
             existing.pop("direction", None)
             if related_links:
                 existing["related_links"] = list(related_links)
-            with path.open("w", encoding="utf-8") as f:
-                yaml.safe_dump(existing, f, allow_unicode=True, sort_keys=False)
+            _atomic_text(path, yaml.safe_dump(existing, allow_unicode=True, sort_keys=False))
+            if direction == "agent-to-user" and os.environ.get("HUMAN_AGENT_NOTIFICATION_BACKEND") == "command":
+                notify_item(existing, path.name)
             return path.name
     filename = f"{now.strftime('%Y%m%dT%H%M%SZ')}_{secrets.token_hex(3)}.yaml"
     path = directory / filename
@@ -646,20 +797,32 @@ def add_item(direction, from_, type_, title, body, related_links=None, dedupe_ke
         "body": body,
         "created_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
+    if project_id:
+        item["project_id"] = project_id
+    if thread_ts:
+        item["slack_thread_ts"] = thread_ts
+    if external_id:
+        item["external_id"] = external_id
     if related_links:
         item["related_links"] = list(related_links)
     if dedupe_key:
         item["dedupe_key"] = dedupe_key
 
-    with path.open("w", encoding="utf-8") as f:
-        yaml.safe_dump(item, f, allow_unicode=True, sort_keys=False)
+    _atomic_text(path, yaml.safe_dump(item, allow_unicode=True, sort_keys=False))
+
+    if external_id:
+        receipt.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_text(receipt, json.dumps({
+            "project_id": project_id, "direction": direction, "filename": filename,
+        }))
 
     if direction == "agent-to-user":
-        notify_line(item, filename)
+        notify_item(item, filename)
 
     return filename
 
 
+@_queue_write
 def resolve_item(direction, dedupe_key):
     dedupe_key = _safe_status_key(dedupe_key, "dedupe_key")
     matches = [item for item in list_items_full(direction) if item.get("dedupe_key") == dedupe_key]
@@ -674,8 +837,9 @@ def _safe_item_filename(filename):
     return filename
 
 
-def get_item(filename, direction=None):
+def get_item(filename, direction=None, project_id=None):
     filename = _safe_item_filename(filename)
+    project_id = _project_id(project_id)
     directions = (direction,) if direction else DIRECTIONS
     for candidate_direction in directions:
         if candidate_direction not in DIRECTIONS:
@@ -684,25 +848,35 @@ def get_item(filename, direction=None):
         if path.exists():
             with path.open(encoding="utf-8") as f:
                 item = yaml.safe_load(f) or {}
+            if project_id and item.get("project_id") != project_id:
+                raise ValueError("board item belongs to another project")
             item["filename"] = filename
             item["direction"] = candidate_direction
             return item
     raise FileNotFoundError(f"{filename} not found")
 
 
-def list_items_full(direction):
+def list_items_full(direction, project_id=None):
+    project_id = _project_id(project_id)
     directory = direction_dir(direction)
     if not directory.exists():
         return []
 
     items = []
     for path in directory.glob("*.yaml"):
-        items.append(get_item(path.name, direction=direction))
+        item = get_item(path.name, direction=direction) if not project_id else None
+        if project_id:
+            with path.open(encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+            if data.get("project_id") != project_id:
+                continue
+            item = get_item(path.name, direction=direction, project_id=project_id)
+        items.append(item)
     items.sort(key=lambda item: item["filename"])
     return items
 
 
-def list_items(direction):
+def list_items(direction, project_id=None):
     return [
         {
             "filename": item["filename"],
@@ -710,8 +884,9 @@ def list_items(direction):
             "type": item.get("type"),
             "title": item.get("title"),
             "created_at": item.get("created_at"),
+            **({"project_id": item["project_id"]} if item.get("project_id") else {}),
         }
-        for item in list_items_full(direction)
+        for item in list_items_full(direction, project_id=project_id)
     ]
 
 
@@ -742,31 +917,67 @@ def dashboard_data(recent=5):
     }
 
 
-def respond_to_item(filename, decision):
+@_queue_write
+def respond_to_item(filename, decision, via="LINE", project_id=None,
+                    expected_digest=None, response_id=None):
     if decision not in ("approval", "rejection"):
         raise ValueError("decision must be approval or rejection")
-    item = get_item(filename, direction="agent-to-user")
+    project_id = _project_id(project_id)
+    if via not in ("LINE", "Slack"):
+        raise ValueError("invalid response channel")
+    if via == "Slack" and (not project_id or not expected_digest or not response_id):
+        raise ValueError("Slack response requires project, digest and response ID")
+    if response_id:
+        response_id = _safe_status_key(response_id, "response_id")
+        receipt = board_root() / "state" / "responses" / (response_id + ".json")
+        if receipt.exists():
+            saved = json.loads(receipt.read_text(encoding="utf-8"))
+            if (saved["project_id"], saved["request"], saved["decision"], saved["digest"]) != (
+                project_id, filename, decision, expected_digest
+            ):
+                raise ValueError("response ID already used for a different decision")
+            try:
+                pending = get_item(filename, direction="agent-to-user", project_id=project_id)
+                if decision_digest(pending) == expected_digest:
+                    complete_item(filename)
+            except FileNotFoundError:
+                pass
+            return saved["response"]
+    item = get_item(filename, direction="agent-to-user", project_id=project_id)
     if item.get("type") not in DECISION_TYPES:
         raise ValueError("board item does not require a decision")
+    if expected_digest and decision_digest(item) != expected_digest:
+        raise ValueError("decision changed; review the current plan before approving")
 
     label = "承認" if decision == "approval" else "却下"
     response_filename = add_item(
         direction="user-to-agent",
         from_="user",
         type_=decision,
-        title=f"{label} (LINE経由): {item.get('title', '')}",
-        body=f"LINE Boardから{label}されました。",
+        title=f"{label} ({via}経由): {item.get('title', '')}",
+        body=f"{via} Boardから{label}されました。",
         related_links=item.get("related_links"),
+        project_id=item.get("project_id"),
+        external_id=("response-" + response_id) if response_id else None,
+        thread_ts=item.get("slack_thread_ts"),
     )
+    if response_id:
+        receipt.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_text(receipt, json.dumps({
+            "project_id": project_id, "request": filename, "decision": decision,
+            "digest": expected_digest, "response": response_filename,
+        }))
     complete_item(filename)
     return response_filename
 
 
+@_queue_write
 def complete_item(filename):
     filename = _safe_item_filename(filename)
     for direction in DIRECTIONS:
         path = direction_dir(direction) / filename
         if path.exists():
+            get_item(filename, direction=direction)
             path.unlink()
             return direction
     raise FileNotFoundError(f"{filename} not found in either direction")
@@ -781,12 +992,21 @@ def _cmd_add(args):
         body=args.body,
         related_links=args.related_link,
         dedupe_key=args.dedupe_key,
+        project_id=args.project_id,
+        external_id=args.external_id,
+        thread_ts=args.thread_ts,
     )
     print(filename)
 
 
 def _cmd_list(args):
-    items = list_items(args.direction)
+    items = list_items_full(args.direction, project_id=args.project_id)
+    if not _project_id(args.project_id) and not args.all_projects:
+        # Existing global workers must not consume a project's Slack letters.
+        items = [item for item in items if not item.get("project_id")]
+    if args.json:
+        print(json.dumps(items, ensure_ascii=False))
+        return
     if not items:
         print("(no pending items)")
         return
@@ -813,7 +1033,10 @@ def _cmd_get(args):
 
 
 def _cmd_respond(args):
-    print(respond_to_item(args.filename, args.decision))
+    print(respond_to_item(
+        args.filename, args.decision, via=args.via, project_id=args.project_id,
+        expected_digest=args.expected_digest, response_id=args.response_id,
+    ))
 
 
 def _cmd_dashboard(args):
@@ -907,6 +1130,8 @@ def _cmd_status_set(args):
         next_action=args.next_action,
         related_links=args.related_link,
         notify=args.notify,
+        project_id=args.project_id,
+        thread_ts=args.thread_ts,
     )
     print(filename)
 
@@ -933,11 +1158,23 @@ def build_parser():
     add_parser.add_argument("--body", required=True)
     add_parser.add_argument("--related-link", action="append", default=None)
     add_parser.add_argument("--dedupe-key")
+    add_parser.add_argument("--project-id")
+    add_parser.add_argument("--external-id")
+    add_parser.add_argument("--thread-ts")
     add_parser.set_defaults(func=_cmd_add)
 
     list_parser = subparsers.add_parser("list", help="List pending items")
     list_parser.add_argument("--direction", choices=DIRECTIONS, required=True)
+    list_parser.add_argument("--project-id")
+    list_parser.add_argument("--json", action="store_true")
+    list_parser.add_argument("--all-projects", action="store_true", help="Explicit global read-only overview")
     list_parser.set_defaults(func=_cmd_list)
+
+    notifications = subparsers.add_parser("notifications", help="Read durable command notifications")
+    notifications.set_defaults(func=lambda args: print(json.dumps(pending_notifications(), ensure_ascii=False)))
+    notification_complete = subparsers.add_parser("notification-complete", help="Acknowledge delivered notification")
+    notification_complete.add_argument("notification_id")
+    notification_complete.set_defaults(func=lambda args: complete_notification(args.notification_id))
 
     complete_parser = subparsers.add_parser("complete", help="Mark an item as done")
     complete_parser.add_argument("filename")
@@ -957,6 +1194,10 @@ def build_parser():
     respond_parser = subparsers.add_parser("respond", help="Approve or reject a decision item")
     respond_parser.add_argument("filename")
     respond_parser.add_argument("--decision", choices=("approval", "rejection"), required=True)
+    respond_parser.add_argument("--via", choices=("LINE", "Slack"), default="LINE")
+    respond_parser.add_argument("--project-id")
+    respond_parser.add_argument("--expected-digest")
+    respond_parser.add_argument("--response-id")
     respond_parser.set_defaults(func=_cmd_respond)
 
     dashboard_parser = subparsers.add_parser("dashboard", help="Show board dashboard data")
@@ -1032,6 +1273,8 @@ def build_parser():
     status_set_parser.add_argument("--next-action")
     status_set_parser.add_argument("--related-link", action="append", default=None)
     status_set_parser.add_argument("--notify", action="store_true")
+    status_set_parser.add_argument("--project-id")
+    status_set_parser.add_argument("--thread-ts")
     status_set_parser.set_defaults(func=_cmd_status_set)
 
     status_list_parser = status_subparsers.add_parser("list", help="List current and recent work status")
