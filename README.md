@@ -52,7 +52,7 @@ python board.py add --direction agent-to-user --from claude --type approval_requ
 # 未処理の依頼を一覧表示
 python board.py list --direction agent-to-user
 
-# LINE等のUI向けに、判断待ち・依頼・通知・作業状況をJSONで取得
+# Slack等のUI向けに、判断待ち・依頼・通知・作業状況をJSONで取得
 python board.py dashboard --json --recent 5
 
 # 1件の内容を取得
@@ -99,21 +99,13 @@ Claude Code等から呼び出すためのスキルは別リポジトリで管理
 
 `add`と`status set`に`--project-id`を指定するか、実行環境の`KOBITO_PROJECT_ID`を継承すると、項目にProjectの所属が付く。その環境での`list`・`get`・`complete`・status一覧は他Projectを扱わない。無指定のCLI `list`はProject付き項目を表示しないため、従来の全体workerが新しいProjectの置き手紙を拾うことを防ぐ。全体の管理用一覧は明示的に`list --all-projects`を使う。
 
-`HUMAN_AGENT_NOTIFICATION_BACKEND=command`と`HUMAN_AGENT_NOTIFICATION_COMMAND`を設定すると、通知は指定コマンドへJSONを標準入力で渡す。シェルを介して実行せず、本文をコマンド引数に埋め込まない。JSONは`{"item": {...}, "filename": "...yaml"}`。`line`が従来の既定で、`none`は通知を停止する。commandに失敗しても項目は保持し、LINEへ重複送信しない。
+通知は`HUMAN_AGENT_NOTIFICATION_COMMAND`で指定したコマンドへJSONを標準入力で渡す（既定の`HUMAN_AGENT_NOTIFICATION_BACKEND=command`）。シェルを介して実行せず、本文をコマンド引数に埋め込まない。JSONは`{"item": {...}, "filename": "...yaml"}`。`HUMAN_AGENT_NOTIFICATION_BACKEND=none`は通知を停止する。コマンドが未設定または失敗しても項目は保持し、通知は下記の未送信一覧に残る。LINE通知は2026-11に廃止した（FEZ-273）。
 
 command通知は`state/notifications/`へ保存する。`notifications`で未送信JSONの一覧を取得し、配信成功後に`notification-complete <id>`で確認できる。kobitoの受付が定期的に再送するため、接続中断時にも計画・状態報告を失わない。Projectの対応表やSlackトークンはこのリポジトリへ保存しない。
 
 Slack向けの実装はkobito側の`project_slack.py notify`が担当する。`--thread-ts`は元の会話スレッドを引き継ぐための値。`--external-id`は受信イベントの重複抑止用で、項目がcompleteされた後もreceiptを保持する。
 
-Slackの承認は`respond --via Slack --project-id ... --expected-digest ... --response-id ...`を使い、現在の計画との一致を確認する。承認・却下・置き手紙の更新はプロセスロックとreceiptで直列化する。古い計画、別Project、同じIDで異なる判断を渡した操作は拒否する。詳細な導入手順はkobitoの`SLACK_SETUP.md`を参照。
-
-### 従来のLINE通知
-
-`agent-to-user`への追加時、環境変数`LINE_CHANNEL_ACCESS_TOKEN`・`LINE_NOTIFY_USER_ID`が設定されていれば、その項目をLINEへpush通知する。`related_links`があれば承認・却下ボタン付きテンプレートに続けて「判断材料」を送り、GitHub・Linearは種別名付き、それ以外は「関連資料」として全URLを表示する。複数のURLは`--related-link`を繰り返して指定する。承認要求には、変更内容を確認できるGitHub PRまたはdiffと、背景・完了条件を確認できるLinear issueを原則として含める。
-
-`related_links`が無い場合は通常テキストのみを送り、承認・却下ボタンは表示しない。環境変数が未設定なら通知は行わない（オプトイン、CLI自体の動作には影響しない）。通知の送信に失敗しても`add`コマンド自体は成功し、boardへの項目追加は保持される。
-
-ボタンからの承認/却下postbackの受信（`user-to-agent`への書き込み）は本リポジトリの責務ではなく、公開HTTPSエンドポイントを持つ別サービス側（例: `ai-gateway`）で実装する。
+Slackの承認は`respond --project-id ... --expected-digest ... --response-id ...`を使い、現在の計画との一致を確認する。Projectに属さない項目（全体実行のkobitoなど）は`--project-id`なしで応答し、Project付きの項目には`--project-id`なしで応答できない。承認・却下・置き手紙の更新はプロセスロックとreceiptで直列化する。古い計画、別Project、同じIDで異なる判断を渡した操作は拒否する。詳細な導入手順はkobitoの`SLACK_SETUP.md`を参照。
 
 ## 作業状況
 
@@ -128,10 +120,10 @@ python board.py status set \
   --related-link "https://linear.app/example/issue/FEZ-111/example"
 ```
 
-状態は`waiting`、`researching`、`implementing`、`verifying`、`decision_pending`、`pr_open`、`completed`、`failed`のいずれか。同じ`source`と`work-id`の進行中状態は上書きされるため、古い途中経過が一覧に残らない。`completed`と`failed`は現在状態から取り除かれ、`status/history/`へ保存される。履歴ファイルは自動削除せず保持し、一覧・LINEでは既定で直近5件だけを表示する（`--recent`で表示件数を変更可能）。
+状態は`waiting`、`researching`、`implementing`、`verifying`、`decision_pending`、`pr_open`、`completed`、`failed`のいずれか。同じ`source`と`work-id`の進行中状態は上書きされるため、古い途中経過が一覧に残らない。`completed`と`failed`は現在状態から取り除かれ、`status/history/`へ保存される。履歴ファイルは自動削除せず保持し、一覧では既定で直近5件だけを表示する（`--recent`で表示件数を変更可能）。
 
-`--notify`を付けるとLINEにも状態を送る。状態通知には判断材料リンクを表示するが、承認・却下ボタンは付けない。通知過多を避けるため、通常は`decision_pending`、`pr_open`、`completed`、`failed`などユーザーに意味のある状態遷移だけで指定する。細かな途中経過はboardの状態だけを更新する。
-同じ`source`・`work-id`で直前と同じ`state`を再記録した場合は、履歴は保存するがLINE通知は重複送信しない。
+`--notify`を付けると状態を通知する。状態通知には判断材料リンクを表示するが、承認・却下ボタンは付けない。通知過多を避けるため、通常は`decision_pending`、`pr_open`、`completed`、`failed`などユーザーに意味のある状態遷移だけで指定する。細かな途中経過はboardの状態だけを更新する。
+同じ`source`・`work-id`で直前と同じ`state`を再記録した場合は、履歴は保存するが通知は重複送信しない。
 
 現在状態と直近履歴は次で確認できる。
 

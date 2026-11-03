@@ -10,10 +10,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 @pytest.fixture
 def board(tmp_path, monkeypatch):
-    # Never inherit real notification credentials in tests. Tests that verify
-    # delivery opt in with explicit fake values.
-    monkeypatch.delenv("LINE_CHANNEL_ACCESS_TOKEN", raising=False)
-    monkeypatch.delenv("LINE_NOTIFY_USER_ID", raising=False)
+    # Never inherit the real notifier. Tests that verify delivery patch notify_item.
+    for key in ("HUMAN_AGENT_NOTIFICATION_BACKEND", "HUMAN_AGENT_NOTIFICATION_COMMAND", "KOBITO_PROJECT_ID"):
+        monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("HUMAN_AGENT_BOARD_ROOT", str(tmp_path / "board"))
     import board as board_module
 
@@ -115,13 +114,14 @@ def test_respond_to_item_records_response_and_completes_request(board):
         related_links=["https://github.com/example/repo/pull/1"],
     )
 
-    response_filename = board.respond_to_item(filename, "approval")
+    digest = board.decision_digest(board.get_item(filename))
+    response_filename = board.respond_to_item(filename, "approval", expected_digest=digest, response_id="r1")
 
     with pytest.raises(FileNotFoundError):
         board.get_item(filename)
     response = board.get_item(response_filename, direction="user-to-agent")
     assert response["type"] == "approval"
-    assert response["title"] == "承認 (LINE経由): deploy?"
+    assert response["title"] == "承認 (Slack経由): deploy?"
     assert response["related_links"] == ["https://github.com/example/repo/pull/1"]
 
 
@@ -135,6 +135,20 @@ def test_respond_rejects_non_decision_item(board):
     )
 
     with pytest.raises(ValueError):
+        board.respond_to_item(filename, "approval", expected_digest="x", response_id="r1")
+
+
+def test_respond_without_project_only_answers_items_without_project(board):
+    scoped = board.add_item("agent-to-user", "kobito", "plan_request", "plan", "body", project_id="project-a")
+    digest = board.decision_digest(board.get_item(scoped))
+    with pytest.raises(ValueError, match="belongs to a project"):
+        board.respond_to_item(scoped, "approval", expected_digest=digest, response_id="r1")
+    assert board.get_item(scoped)
+
+
+def test_respond_requires_digest_and_response_id(board):
+    filename = board.add_item("agent-to-user", "kobito", "plan_request", "plan", "body")
+    with pytest.raises(ValueError, match="digest and response ID"):
         board.respond_to_item(filename, "approval")
 
 
@@ -227,7 +241,7 @@ def test_run_health_detects_stale_and_consecutive_failures(board):
 
 def test_add_dedupe_key_updates_one_item_and_resolve_removes_it(board, monkeypatch):
     notifications = []
-    monkeypatch.setattr(board, "notify_line", lambda item, filename: notifications.append(filename))
+    monkeypatch.setattr(board, "notify_item", lambda item, filename: notifications.append(filename))
 
     first = board.add_item(
         "agent-to-user", "kobito", "action_required", "Fix auth", "first",
@@ -241,7 +255,8 @@ def test_add_dedupe_key_updates_one_item_and_resolve_removes_it(board, monkeypat
     assert first == second
     assert len(board.list_items_full("agent-to-user")) == 1
     assert board.get_item(first)["body"] == "second"
-    assert notifications == [first]
+    # The Slack notifier deduplicates by content, so an updated body is delivered again.
+    assert notifications == [first, first]
     assert board.resolve_item("agent-to-user", "connectivity-preflight") == 1
     assert board.list_items_full("agent-to-user") == []
 
@@ -277,124 +292,9 @@ def test_record_vm_event_rejects_unknown_values(board):
         board.record_vm_event("create", "unknown", "vm", "project", "zone")
 
 
-def test_notify_line_noop_without_env(board, monkeypatch):
-    monkeypatch.delenv("LINE_CHANNEL_ACCESS_TOKEN", raising=False)
-    monkeypatch.delenv("LINE_NOTIFY_USER_ID", raising=False)
-    calls = []
-    monkeypatch.setattr(
-        board.urllib.request, "urlopen", lambda *a, **k: calls.append((a, k))
-    )
-
-    board.add_item(
-        direction="agent-to-user",
-        from_="kobito",
-        type_="plan_request",
-        title="do the thing",
-        body="details",
-        related_links=["https://example.com/issue"],
-    )
-
-    assert calls == []
-
-
-def test_notify_line_pushes_buttons_and_related_links_when_configured(board, monkeypatch):
-    monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "test-token")
-    monkeypatch.setenv("LINE_NOTIFY_USER_ID", "U1234")
-    calls = []
-
-    def fake_urlopen(request, timeout=None):
-        calls.append(request)
-
-        class _Resp:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *exc):
-                return False
-
-        return _Resp()
-
-    monkeypatch.setattr(board.urllib.request, "urlopen", fake_urlopen)
-
-    board.add_item(
-        direction="agent-to-user",
-        from_="kobito",
-        type_="plan_request",
-        title="do the thing",
-        body="details",
-        related_links=[
-            "https://github.com/fezzlk/human-agent-board/pull/1",
-            "https://linear.app/fezzlk/issue/FEZ-110/example",
-            "https://example.com/design",
-        ],
-    )
-
-    assert len(calls) == 1
-    payload = json.loads(calls[0].data)
-    assert payload["to"] == "U1234"
-    assert len(payload["messages"]) == 2
-    template = payload["messages"][0]["template"]
-    assert template["actions"][0]["data"] == (
-        "approve|https://github.com/fezzlk/human-agent-board/pull/1"
-    )
-    assert template["actions"][1]["data"] == (
-        "reject|https://github.com/fezzlk/human-agent-board/pull/1"
-    )
-    details = payload["messages"][1]
-    assert details["type"] == "text"
-    assert "GitHub: https://github.com/fezzlk/human-agent-board/pull/1" in details["text"]
-    assert "Linear: https://linear.app/fezzlk/issue/FEZ-110/example" in details["text"]
-    assert "関連資料 3: https://example.com/design" in details["text"]
-
-
-def test_notify_line_without_related_links_sends_text_only(board, monkeypatch):
-    monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "test-token")
-    monkeypatch.setenv("LINE_NOTIFY_USER_ID", "U1234")
-    calls = []
-
-    def fake_urlopen(request, timeout=None):
-        calls.append(request)
-
-    monkeypatch.setattr(board.urllib.request, "urlopen", fake_urlopen)
-
-    board.add_item(
-        direction="agent-to-user",
-        from_="kobito",
-        type_="fyi",
-        title="status",
-        body="no approval required",
-    )
-
-    payload = json.loads(calls[0].data)
-    assert payload["messages"] == [{"type": "text", "text": "status\nno approval required"}]
-
-
-def test_action_required_notification_keeps_recovery_details(board, monkeypatch):
-    monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "test-token")
-    monkeypatch.setenv("LINE_NOTIFY_USER_ID", "U1234")
-    calls = []
-    monkeypatch.setattr(
-        board.urllib.request, "urlopen",
-        lambda request, timeout=None: calls.append(request),
-    )
-    body = "原因: SSH接続失敗\n影響: 作業未実行\n対処: Tailscaleを確認\n再試行: 3時間後"
-
-    board.add_item(
-        direction="agent-to-user", from_="kobito", type_="action_required",
-        title="kobito障害", body=body,
-    )
-
-    payload = json.loads(calls[0].data)
-    assert body in payload["messages"][0]["text"]
-
-
 def test_status_notification_has_links_without_decision_buttons(board, monkeypatch):
-    monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "test-token")
-    monkeypatch.setenv("LINE_NOTIFY_USER_ID", "U1234")
     calls = []
-    monkeypatch.setattr(
-        board.urllib.request, "urlopen", lambda request, timeout=None: calls.append(request)
-    )
+    monkeypatch.setattr(board, "notify_item", lambda item, filename: calls.append(item))
 
     board.set_status(
         source="kobito",
@@ -409,20 +309,17 @@ def test_status_notification_has_links_without_decision_buttons(board, monkeypat
         notify=True,
     )
 
-    payload = json.loads(calls[0].data)
-    assert [message["type"] for message in payload["messages"]] == ["text", "text"]
-    assert "[pr_open] PR is ready" in payload["messages"][0]["text"]
-    assert "GitHub:" in payload["messages"][1]["text"]
-    assert "Linear:" in payload["messages"][1]["text"]
+    assert calls[0]["type"] not in board.DECISION_TYPES
+    assert "[pr_open] PR is ready" in calls[0]["body"]
+    assert calls[0]["related_links"] == [
+        "https://github.com/fezzlk/human-agent-board/pull/2",
+        "https://linear.app/fezzlk/issue/FEZ-111/example",
+    ]
 
 
 def test_repeated_status_state_does_not_notify_twice(board, monkeypatch):
-    monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "test-token")
-    monkeypatch.setenv("LINE_NOTIFY_USER_ID", "U1234")
     calls = []
-    monkeypatch.setattr(
-        board.urllib.request, "urlopen", lambda request, timeout=None: calls.append(request)
-    )
+    monkeypatch.setattr(board, "notify_item", lambda item, filename: calls.append(item))
 
     for summary in ("first details", "same failure, reworded"):
         board.set_status(
@@ -435,6 +332,14 @@ def test_repeated_status_state_does_not_notify_twice(board, monkeypatch):
         )
 
     assert len(calls) == 1
+
+
+def test_notification_without_command_stays_pending(board, capsys):
+    filename = board.add_item("agent-to-user", "kobito", "action_required", "kobito障害", "対処: 再起動")
+
+    pending = board.pending_notifications()
+    assert [entry["filename"] for entry in pending] == [filename]
+    assert "pending" in capsys.readouterr().err
 
 
 def test_set_status_updates_current_snapshot(board):
@@ -498,27 +403,6 @@ def test_status_key_rejects_path_traversal(board):
         )
 
 
-def test_notify_line_failure_does_not_raise(board, monkeypatch):
-    monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "test-token")
-    monkeypatch.setenv("LINE_NOTIFY_USER_ID", "U1234")
-
-    def raise_error(*a, **k):
-        raise board.urllib.error.URLError("boom")
-
-    monkeypatch.setattr(board.urllib.request, "urlopen", raise_error)
-
-    filename = board.add_item(
-        direction="agent-to-user",
-        from_="kobito",
-        type_="plan_request",
-        title="do the thing",
-        body="details",
-        related_links=["https://example.com/issue"],
-    )
-
-    assert board.list_items("agent-to-user")[0]["filename"] == filename
-
-
 def test_record_and_dashboard_usage(board):
     board.record_usage(
         "codex", 20, 40, "reset-a", "reset-b", "FEZ-113",
@@ -539,85 +423,3 @@ def test_record_and_dashboard_usage(board):
 def test_record_usage_rejects_invalid_percentage(board):
     with pytest.raises(ValueError, match="between 0 and 100"):
         board.record_usage("claude", 101)
-
-
-def test_priority_digest_noop_on_empty(board, monkeypatch):
-    monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "test-token")
-    monkeypatch.setenv("LINE_NOTIFY_USER_ID", "U1234")
-    calls = []
-    monkeypatch.setattr(
-        board.urllib.request, "urlopen", lambda *a, **k: calls.append((a, k))
-    )
-
-    board.priority_digest([])
-
-    assert calls == []
-
-
-def test_priority_digest_sends_carousel_with_priority_buttons(board, monkeypatch):
-    monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "test-token")
-    monkeypatch.setenv("LINE_NOTIFY_USER_ID", "U1234")
-    calls = []
-
-    def fake_urlopen(request, timeout=None):
-        calls.append(request)
-
-        class _Resp:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *exc):
-                return False
-
-        return _Resp()
-
-    monkeypatch.setattr(board.urllib.request, "urlopen", fake_urlopen)
-
-    board.priority_digest([
-        {
-            "id": "issue-uuid-1",
-            "identifier": "FEZ-200",
-            "title": "example issue",
-            "project": "kobito",
-            "url": "https://linear.app/fezzlk/issue/FEZ-200/example",
-        },
-    ])
-
-    assert len(calls) == 1
-    payload = json.loads(calls[0].data)
-    assert payload["to"] == "U1234"
-    bubble = payload["messages"][0]["contents"]["contents"][0]
-    actions = [b["action"] for b in bubble["footer"]["contents"]]
-    assert actions[0]["data"] == "setpriority|issue-uuid-1|1"
-    assert actions[0]["label"] == "Urgent"
-    assert actions[3]["data"] == "setpriority|issue-uuid-1|4"
-    assert actions[3]["label"] == "Low"
-
-
-def test_priority_digest_caps_at_twelve_bubbles(board, monkeypatch):
-    monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "test-token")
-    monkeypatch.setenv("LINE_NOTIFY_USER_ID", "U1234")
-    calls = []
-
-    def fake_urlopen(request, timeout=None):
-        calls.append(request)
-
-        class _Resp:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *exc):
-                return False
-
-        return _Resp()
-
-    monkeypatch.setattr(board.urllib.request, "urlopen", fake_urlopen)
-
-    issues = [
-        {"id": f"issue-{i}", "identifier": f"FEZ-{i}", "title": "t", "project": "p"}
-        for i in range(20)
-    ]
-    board.priority_digest(issues)
-
-    payload = json.loads(calls[0].data)
-    assert len(payload["messages"][0]["contents"]["contents"]) == 12

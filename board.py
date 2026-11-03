@@ -16,9 +16,7 @@ import sys
 import tempfile
 import threading
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -39,10 +37,6 @@ TERMINAL_WORK_STATES = ("completed", "failed")
 RUN_OUTCOMES = ("completed", "failed", "blocked", "no_work")
 DECISION_TYPES = ("approval_request", "decision_request", "plan_request")
 
-LINE_PUSH_URL = "https://api.line.me/v2/bot/message/push"
-_LINE_TITLE_MAX = 40
-_LINE_TEXT_MAX = 60
-_LINE_DETAILS_MAX = 5000
 _QUEUE_MUTEX = threading.RLock()
 _QUEUE_LOCAL = threading.local()
 
@@ -104,9 +98,7 @@ def _atomic_text(path, text):
 
 
 def notify_item(item, filename):
-    backend = os.environ.get("HUMAN_AGENT_NOTIFICATION_BACKEND", "line")
-    if backend == "line":
-        return notify_line(item, filename)
+    backend = os.environ.get("HUMAN_AGENT_NOTIFICATION_BACKEND", "command")
     if backend == "none":
         return
     if backend != "command":
@@ -118,7 +110,8 @@ def notify_item(item, filename):
     _atomic_text(pending, payload)
     command = os.environ.get("HUMAN_AGENT_NOTIFICATION_COMMAND", "")
     if not command:
-        print("notification command is not configured", file=sys.stderr)
+        # Kept in the outbox; the Slack listener delivers it on its next sync.
+        print("notification command is not configured; notification is pending", file=sys.stderr)
         return
     try:
         completed = subprocess.run(
@@ -149,13 +142,6 @@ def complete_notification(notification_id):
     (board_root() / "state" / "notifications" / (notification_id + ".json")).unlink(missing_ok=True)
 
 
-def _truncate(text, limit):
-    text = (text or "").strip()
-    if len(text) <= limit:
-        return text
-    return text[: limit - 1].rstrip() + "…"
-
-
 def _related_link_label(url, index):
     hostname = (urllib.parse.urlparse(url).hostname or "").lower()
     if hostname == "github.com" or hostname.endswith(".github.com"):
@@ -163,156 +149,6 @@ def _related_link_label(url, index):
     if hostname == "linear.app" or hostname.endswith(".linear.app"):
         return "Linear"
     return f"関連資料 {index}"
-
-
-def _format_related_links(related_links):
-    lines = ["判断材料（内容を確認してから承認・却下してください）"]
-    for index, url in enumerate(related_links, start=1):
-        lines.append(f"{_related_link_label(url, index)}: {url}")
-    return _truncate("\n".join(lines), _LINE_DETAILS_MAX)
-
-
-def notify_line(item, filename):
-    """Best-effort LINE push for a new agent-to-user item. No-op if the LINE
-    env vars aren't configured, and never raises -- a notification failure
-    must not affect the CLI's core add/list/complete behavior."""
-    token = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
-    user_id = os.environ.get("LINE_NOTIFY_USER_ID", "")
-    if not token or not user_id:
-        return
-
-    related_links = item.get("related_links") or []
-    title = _truncate(item.get("title"), _LINE_TITLE_MAX)
-    requires_decision = item.get("type") in DECISION_TYPES
-    # LINE button templates allow only a short text field, but ordinary
-    # action/fyi notifications are regular text messages and should retain
-    # the diagnosis and recovery steps instead of becoming unactionable.
-    text_limit = _LINE_TEXT_MAX if requires_decision else _LINE_DETAILS_MAX
-    text = _truncate(item.get("body"), text_limit)
-
-    if related_links and requires_decision:
-        messages = [{
-            "type": "template",
-            "altText": title or "human-agent-board",
-            "template": {
-                "type": "buttons",
-                "title": title or "human-agent-board",
-                "text": text or "(no details)",
-                "actions": [
-                    {
-                        "type": "postback",
-                        "label": "承認",
-                        "data": f"approve|{related_links[0]}",
-                    },
-                    {
-                        "type": "postback",
-                        "label": "却下",
-                        "data": f"reject|{related_links[0]}",
-                    },
-                ],
-            },
-        }, {
-            "type": "text",
-            "text": _format_related_links(related_links),
-        }]
-    else:
-        messages = [{
-            "type": "text",
-            "text": f"{title}\n{text}".strip() or "human-agent-board: new item",
-        }]
-        if related_links:
-            messages.append({
-                "type": "text",
-                "text": _format_related_links(related_links),
-            })
-
-    _push_line_messages(messages, token=token, user_id=user_id)
-
-
-def _push_line_messages(messages, token=None, user_id=None):
-    """Best-effort LINE push of a pre-built messages array. No-op if the LINE
-    env vars aren't configured (unless explicitly passed in), and never
-    raises -- callers must keep working even if the notification fails."""
-    token = token or os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
-    user_id = user_id or os.environ.get("LINE_NOTIFY_USER_ID", "")
-    if not token or not user_id:
-        return
-
-    payload = json.dumps({"to": user_id, "messages": messages}).encode("utf-8")
-    request = urllib.request.Request(
-        LINE_PUSH_URL,
-        data=payload,
-        method="POST",
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {token}",
-        },
-    )
-    try:
-        urllib.request.urlopen(request, timeout=10)
-    except (urllib.error.URLError, OSError) as e:
-        print(f"_push_line_messages: failed to push LINE notification: {e}", file=sys.stderr)
-
-
-_PRIORITY_LABELS = {1: "Urgent", 2: "High", 3: "Medium", 4: "Low"}
-_PRIORITY_DIGEST_MAX_BUBBLES = 12
-_PRIORITY_BUBBLE_TITLE_MAX = 60
-
-
-def priority_digest(issues):
-    """Push a LINE Flex carousel with one bubble per issue (identifier,
-    title, project) and four priority buttons (Urgent/High/Medium/Low) that
-    postback `setpriority|<issueId>|<priorityValue>`. No-op on an empty
-    list or when LINE env vars aren't configured."""
-    issues = list(issues)[:_PRIORITY_DIGEST_MAX_BUBBLES]
-    if not issues:
-        return
-
-    bubbles = []
-    for issue in issues:
-        issue_id = issue["id"]
-        identifier = issue.get("identifier", "")
-        title = _truncate(issue.get("title"), _PRIORITY_BUBBLE_TITLE_MAX)
-        project = issue.get("project", "")
-        bubbles.append({
-            "type": "bubble",
-            "body": {
-                "type": "box",
-                "layout": "vertical",
-                "spacing": "sm",
-                "contents": [
-                    {"type": "text", "text": identifier, "size": "xs", "color": "#9CA3AF"},
-                    {"type": "text", "text": title, "weight": "bold", "wrap": True},
-                    {"type": "text", "text": project, "size": "xs", "color": "#6B7280"},
-                ],
-            },
-            "footer": {
-                "type": "box",
-                "layout": "vertical",
-                "spacing": "sm",
-                "contents": [
-                    {
-                        "type": "button",
-                        "style": "primary" if value <= 2 else "secondary",
-                        "height": "sm",
-                        "action": {
-                            "type": "postback",
-                            "label": label,
-                            "data": f"setpriority|{issue_id}|{value}",
-                            "displayText": f"{identifier}: {label}",
-                        },
-                    }
-                    for value, label in _PRIORITY_LABELS.items()
-                ],
-            },
-        })
-
-    messages = [{
-        "type": "flex",
-        "altText": f"優先度未設定のissueが{len(bubbles)}件あります",
-        "contents": {"type": "carousel", "contents": bubbles},
-    }]
-    _push_line_messages(messages)
 
 
 def board_root() -> Path:
@@ -671,7 +507,7 @@ def set_status(source, work_id, state, title, summary, next_action=None,
         yaml.safe_dump(item, f, allow_unicode=True, sort_keys=False)
 
     # Preserve repeated unattended results in history, but alert only when the
-    # state changes. Reworded copies of the same failure should not spam LINE.
+    # state changes. Reworded copies of the same failure should not spam notifications.
     if notify and previous_state != state:
         notify_item(
             {
@@ -784,7 +620,7 @@ def add_item(direction, from_, type_, title, body, related_links=None, dedupe_ke
             if related_links:
                 existing["related_links"] = list(related_links)
             _atomic_text(path, yaml.safe_dump(existing, allow_unicode=True, sort_keys=False))
-            if direction == "agent-to-user" and os.environ.get("HUMAN_AGENT_NOTIFICATION_BACKEND") == "command":
+            if direction == "agent-to-user" and os.environ.get("HUMAN_AGENT_NOTIFICATION_BACKEND", "command") == "command":
                 notify_item(existing, path.name)
             return path.name
     filename = f"{now.strftime('%Y%m%dT%H%M%SZ')}_{secrets.token_hex(3)}.yaml"
@@ -918,15 +754,15 @@ def dashboard_data(recent=5):
 
 
 @_queue_write
-def respond_to_item(filename, decision, via="LINE", project_id=None,
+def respond_to_item(filename, decision, via="Slack", project_id=None,
                     expected_digest=None, response_id=None):
     if decision not in ("approval", "rejection"):
         raise ValueError("decision must be approval or rejection")
     project_id = _project_id(project_id)
-    if via not in ("LINE", "Slack"):
+    if via != "Slack":
         raise ValueError("invalid response channel")
-    if via == "Slack" and (not project_id or not expected_digest or not response_id):
-        raise ValueError("Slack response requires project, digest and response ID")
+    if not expected_digest or not response_id:
+        raise ValueError("Slack response requires digest and response ID")
     if response_id:
         response_id = _safe_status_key(response_id, "response_id")
         receipt = board_root() / "state" / "responses" / (response_id + ".json")
@@ -944,6 +780,9 @@ def respond_to_item(filename, decision, via="LINE", project_id=None,
                 pass
             return saved["response"]
     item = get_item(filename, direction="agent-to-user", project_id=project_id)
+    if not project_id and item.get("project_id"):
+        # Without a project scope, only items that belong to no project can be answered.
+        raise ValueError("board item belongs to a project")
     if item.get("type") not in DECISION_TYPES:
         raise ValueError("board item does not require a decision")
     if expected_digest and decision_digest(item) != expected_digest:
@@ -1140,12 +979,6 @@ def _cmd_status_list(args):
     print(format_status_list(source=args.source, recent=args.recent))
 
 
-def _cmd_priority_digest(args):
-    issues = json.load(sys.stdin)
-    priority_digest(issues)
-    print(f"sent digest for {min(len(issues), _PRIORITY_DIGEST_MAX_BUBBLES)} issue(s)")
-
-
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1194,7 +1027,7 @@ def build_parser():
     respond_parser = subparsers.add_parser("respond", help="Approve or reject a decision item")
     respond_parser.add_argument("filename")
     respond_parser.add_argument("--decision", choices=("approval", "rejection"), required=True)
-    respond_parser.add_argument("--via", choices=("LINE", "Slack"), default="LINE")
+    respond_parser.add_argument("--via", choices=("Slack",), default="Slack")
     respond_parser.add_argument("--project-id")
     respond_parser.add_argument("--expected-digest")
     respond_parser.add_argument("--response-id")
@@ -1281,12 +1114,6 @@ def build_parser():
     status_list_parser.add_argument("--source")
     status_list_parser.add_argument("--recent", type=int, default=5)
     status_list_parser.set_defaults(func=_cmd_status_list)
-
-    priority_digest_parser = subparsers.add_parser(
-        "priority-digest",
-        help="Push a LINE carousel of no-priority issues (JSON array via stdin)",
-    )
-    priority_digest_parser.set_defaults(func=_cmd_priority_digest)
 
     return parser
 

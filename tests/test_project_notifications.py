@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 @pytest.fixture
 def board(tmp_path, monkeypatch):
-    for key in ("LINE_CHANNEL_ACCESS_TOKEN", "LINE_NOTIFY_USER_ID", "KOBITO_PROJECT_ID",
+    for key in ("KOBITO_PROJECT_ID",
                 "KOBITO_SLACK_THREAD_TS", "HUMAN_AGENT_NOTIFICATION_COMMAND", "HUMAN_AGENT_NOTIFICATION_BACKEND"):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("HUMAN_AGENT_BOARD_ROOT", str(tmp_path / "board"))
@@ -92,11 +92,9 @@ def test_crash_before_external_receipt_does_not_duplicate_letter(board):
     assert len(board.list_items("user-to-agent")) == 1
 
 
-def test_notification_command_is_opt_in_shell_free_and_has_no_line_fallback(board, monkeypatch):
-    monkeypatch.setenv("HUMAN_AGENT_NOTIFICATION_BACKEND", "command")
+def test_notification_command_is_the_default_and_shell_free(board, monkeypatch):
     monkeypatch.setenv("HUMAN_AGENT_NOTIFICATION_COMMAND", "python3 '/path with spaces/notify.py'")
     calls = []
-    monkeypatch.setattr(board, "notify_line", lambda *args: pytest.fail("must not duplicate LINE notification"))
     def run(argv, **kwargs):
         calls.append((argv, json.loads(kwargs["input"])))
         assert "shell" not in kwargs
