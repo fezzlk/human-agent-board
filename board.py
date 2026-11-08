@@ -692,6 +692,34 @@ def get_item(filename, direction=None, project_id=None):
     raise FileNotFoundError(f"{filename} not found")
 
 
+REQUIRED_ITEM_KEYS = ("from", "type", "title")
+
+
+def _load_queue_item(path):
+    """Load one queue file, or return None (with a warning) if it is malformed.
+
+    A single broken or foreign-format file must not make the whole queue
+    unreadable, so listing skips it and reports it on stderr instead.
+    """
+    try:
+        with path.open(encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+    except (OSError, yaml.YAMLError) as exc:
+        print(f"warning: skipping unreadable board item {path.name}: {exc}", file=sys.stderr)
+        return None
+    if not isinstance(data, dict):
+        print(f"warning: skipping malformed board item {path.name}: not a mapping", file=sys.stderr)
+        return None
+    missing = [key for key in REQUIRED_ITEM_KEYS if key not in data]
+    if missing:
+        print(
+            f"warning: skipping malformed board item {path.name}: missing {', '.join(missing)}",
+            file=sys.stderr,
+        )
+        return None
+    return data
+
+
 def list_items_full(direction, project_id=None):
     project_id = _project_id(project_id)
     directory = direction_dir(direction)
@@ -700,13 +728,14 @@ def list_items_full(direction, project_id=None):
 
     items = []
     for path in directory.glob("*.yaml"):
-        item = get_item(path.name, direction=direction) if not project_id else None
-        if project_id:
-            with path.open(encoding="utf-8") as f:
-                data = yaml.safe_load(f) or {}
-            if data.get("project_id") != project_id:
-                continue
-            item = get_item(path.name, direction=direction, project_id=project_id)
+        data = _load_queue_item(path)
+        if data is None:
+            continue
+        if project_id and data.get("project_id") != project_id:
+            continue
+        item = dict(data)
+        item["filename"] = path.name
+        item["direction"] = direction
         items.append(item)
     items.sort(key=lambda item: item["filename"])
     return items

@@ -38,6 +38,48 @@ def test_add_then_list(board):
     assert items[0]["title"] == "Deploy to prod?"
 
 
+def test_list_skips_malformed_items_and_warns(board, capsys):
+    filename = board.add_item(
+        direction="agent-to-user",
+        from_="claude",
+        type_="approval_request",
+        title="Deploy to prod?",
+        body="details here",
+    )
+    directory = board.direction_dir("agent-to-user")
+    # A status-shaped record without from/type, a non-mapping, and broken YAML.
+    (directory / "20200101T000000Z_aaaaaa.yaml").write_text(
+        "source: user\nwork_id: X-1\nstate: rejected\ntitle: misplaced\n", encoding="utf-8"
+    )
+    (directory / "20200101T000001Z_bbbbbb.yaml").write_text("- just\n- a list\n", encoding="utf-8")
+    (directory / "20200101T000002Z_cccccc.yaml").write_text("from: [unclosed\n", encoding="utf-8")
+
+    items = board.list_items("agent-to-user")
+    dashboard = board.dashboard_data()
+
+    assert [item["filename"] for item in items] == [filename]
+    assert [item["filename"] for item in dashboard["decisions"] + dashboard["notifications"]] == [filename]
+    err = capsys.readouterr().err
+    assert "20200101T000000Z_aaaaaa.yaml: missing from, type" in err
+    assert "20200101T000001Z_bbbbbb.yaml: not a mapping" in err
+    assert "20200101T000002Z_cccccc.yaml" in err
+
+
+def test_cli_list_does_not_crash_on_malformed_item(board, capsys):
+    board.add_item(
+        direction="agent-to-user", from_="claude", type_="fyi", title="ok", body="b",
+    )
+    (board.direction_dir("agent-to-user") / "20200101T000000Z_aaaaaa.yaml").write_text(
+        "title: no sender\n", encoding="utf-8"
+    )
+
+    assert board.main(["list", "--direction", "agent-to-user"]) == 0
+
+    captured = capsys.readouterr()
+    assert "\tclaude\tfyi\tok" in captured.out
+    assert "missing from, type" in captured.err
+
+
 def test_list_empty_direction_returns_empty(board):
     assert board.list_items("user-to-agent") == []
 
